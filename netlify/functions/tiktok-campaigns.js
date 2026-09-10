@@ -163,10 +163,32 @@ async function isCampaignCreatorCampaign(supabase, campaignId) {
   }
 }
 
+// A WH Warmup campaign never needs the manual "tracked" step either —
+// wh-warmup.js lets the operator pick ANY advertiser under a connection
+// (never flips that advertiser's `tracked` flag, unlike stray-campaign
+// discovery, which does) — so without this carve-out the manual pause/delete
+// controls in the "WHs Warming Up" panel 403 with "not tracked" for any such
+// campaign, even though the automatic cleanup poll manages it fine (it talks
+// to TikTok directly and never goes through this gate). Optional table
+// (no-op false until supabase/wh_warmup.sql is run).
+async function isWhWarmupCampaign(supabase, campaignId) {
+  try {
+    const { data } = await supabase
+      .from("wh_warmup_campaigns")
+      .select("campaign_id")
+      .eq("campaign_id", String(campaignId))
+      .maybeSingle();
+    return !!data;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Loads a stored campaign row and confirms it's ours to manage: either its
 // advertiser account is explicitly `tracked` (the legacy manual selection,
 // kept working for back-compat), or the campaign itself was created by
-// Campaign Creator — which needs no manual tracking at all.
+// Campaign Creator, or it's a WH Warmup campaign — neither of which needs any
+// manual tracking at all.
 async function resolveTrackedCampaign(supabase, campaignId) {
   const { data: campaign } = await supabase
     .from("tiktok_campaigns")
@@ -184,7 +206,11 @@ async function resolveTrackedCampaign(supabase, campaignId) {
   if (!adv) {
     return { error: json(403, { error: "That advertiser account is not tracked." }) };
   }
-  if (!adv.tracked && !(await isCampaignCreatorCampaign(supabase, campaign.campaign_id))) {
+  if (
+    !adv.tracked &&
+    !(await isCampaignCreatorCampaign(supabase, campaign.campaign_id)) &&
+    !(await isWhWarmupCampaign(supabase, campaign.campaign_id))
+  ) {
     return { error: json(403, { error: "That advertiser account is not tracked." }) };
   }
 
