@@ -146,49 +146,23 @@ async function readCampaigns(supabase) {
   return res;
 }
 
-// A campaign created through Campaign Creator never needs the old manual
-// "tracked" step — campaign_creator_campaigns is itself the authoritative
-// record that this campaign is ours to manage. Optional table (no-op false
-// until supabase/campaign_creator.sql is run).
-async function isCampaignCreatorCampaign(supabase, campaignId) {
-  try {
-    const { data } = await supabase
-      .from("campaign_creator_campaigns")
-      .select("campaign_id")
-      .eq("campaign_id", String(campaignId))
-      .maybeSingle();
-    return !!data;
-  } catch (_) {
-    return false;
-  }
-}
-
-// A WH Warmup campaign never needs the manual "tracked" step either —
-// wh-warmup.js lets the operator pick ANY advertiser under a connection
-// (never flips that advertiser's `tracked` flag, unlike stray-campaign
-// discovery, which does) — so without this carve-out the manual pause/delete
-// controls in the "WHs Warming Up" panel 403 with "not tracked" for any such
-// campaign, even though the automatic cleanup poll manages it fine (it talks
-// to TikTok directly and never goes through this gate). Optional table
-// (no-op false until supabase/wh_warmup.sql is run).
-async function isWhWarmupCampaign(supabase, campaignId) {
-  try {
-    const { data } = await supabase
-      .from("wh_warmup_campaigns")
-      .select("campaign_id")
-      .eq("campaign_id", String(campaignId))
-      .maybeSingle();
-    return !!data;
-  } catch (_) {
-    return false;
-  }
-}
-
-// Loads a stored campaign row and confirms it's ours to manage: either its
-// advertiser account is explicitly `tracked` (the legacy manual selection,
-// kept working for back-compat), or the campaign itself was created by
-// Campaign Creator, or it's a WH Warmup campaign — neither of which needs any
-// manual tracking at all.
+// Loads a stored campaign row and its advertiser metadata (status/timezone/bc)
+// so the caller can act on it.
+//
+// This deliberately does NOT require the advertiser's `tracked` flag: GET
+// /tiktok-campaigns (readCampaigns, which is what populates Detailed Metrics)
+// never filters by `tracked` either, so any campaign row a user can see and
+// click "Delete"/toggle on has already been vouched for by the fact that it's
+// sitting in tiktok_campaigns at all — it was put there by our own discovery
+// (discoverAndStoreCampaigns), Campaign Creator, or WH Warmup, all of which
+// look up campaign_id server-side against rows the dashboard itself wrote.
+// Requiring `tracked` on top of that only ever produced a confusing "not
+// tracked" dead end for campaigns the user was staring right at — Campaign
+// Creator and WH Warmup campaigns never set `tracked`, and even a
+// legitimately-tracked advertiser can be unchecked later while its old
+// campaign rows linger in the table (no sync path retroactively removes
+// them). If the advertiser row itself is missing entirely, there's no
+// status/timezone to act with, so that case is still refused.
 async function resolveTrackedCampaign(supabase, campaignId) {
   const { data: campaign } = await supabase
     .from("tiktok_campaigns")
@@ -204,14 +178,7 @@ async function resolveTrackedCampaign(supabase, campaignId) {
     .eq("advertiser_id", campaign.advertiser_id)
     .maybeSingle();
   if (!adv) {
-    return { error: json(403, { error: "That advertiser account is not tracked." }) };
-  }
-  if (
-    !adv.tracked &&
-    !(await isCampaignCreatorCampaign(supabase, campaign.campaign_id)) &&
-    !(await isWhWarmupCampaign(supabase, campaign.campaign_id))
-  ) {
-    return { error: json(403, { error: "That advertiser account is not tracked." }) };
+    return { error: json(403, { error: "That advertiser account is no longer known to this dashboard — run a sync first." }) };
   }
 
   const { data: conn } = await supabase
