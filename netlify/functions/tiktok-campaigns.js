@@ -41,6 +41,7 @@ const {
   discoverAndStoreCampaigns,
   loadCampaignDetail,
   loadCampaignMetricsForAdvertiser,
+  loadCampaignMetricsViaAdGroups,
   setCampaignStatus,
   setAdGroupStatus,
   deleteCampaign,
@@ -1047,6 +1048,11 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
     .from("tiktok_campaigns")
     .select("campaign_id, connection_id, advertiser_id, campaign_name, effective_status, auto_budget_baseline, auto_budget_bumps");
   const knownById = new Map((known || []).map((c) => [String(c.campaign_id), c]));
+  const knownByAdvertiser = {};
+  for (const c of known || []) {
+    const k = String(c.advertiser_id);
+    (knownByAdvertiser[k] = knownByAdvertiser[k] || []).push(String(c.campaign_id));
+  }
 
   // WH Warmup campaigns are throwaway (auto-delete once Active) — never
   // worth scaling their budget.
@@ -1111,6 +1117,24 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
         }
         try {
           const byId = await loadCampaignMetricsForAdvertiser(client, advId, { date });
+
+          // TikTok's AUCTION_CAMPAIGN report occasionally omits a row for a
+          // campaign we know is active (seen on some auto/Smart+-style
+          // campaigns) even though its ad groups have real spend. Backfill
+          // any tracked campaign missing from this report via the
+          // ad-group-level report instead — same data the expanded ad-group
+          // panel already gets successfully for these campaigns.
+          const expected = knownByAdvertiser[advId] || [];
+          const missing = expected.filter((cid) => !(cid in byId));
+          if (missing.length) {
+            try {
+              const fallback = await loadCampaignMetricsViaAdGroups(client, advId, missing, date);
+              for (const [cid, m] of Object.entries(fallback)) byId[cid] = m;
+            } catch (err) {
+              console.warn(`[tiktok-metrics] ad-group fallback failed adv=${advId}: ${err.message}`);
+            }
+          }
+
           for (const [cid, m] of Object.entries(byId)) metrics[cid] = m;
           okAdvertiserIds.push(advId);
 

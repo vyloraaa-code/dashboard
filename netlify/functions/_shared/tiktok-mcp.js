@@ -1206,6 +1206,83 @@ async function loadCampaignMetricsForAdvertiser(client, advertiserId, { date } =
   return byId;
 }
 
+// Fallback for campaigns TikTok's AUCTION_CAMPAIGN report simply omits a row
+// for (observed for some auto/Smart+-style campaigns) even though the
+// account's own AUCTION_ADGROUP report has real data for their ad groups —
+// the same report_integrated_get call the ad-group detail panel already
+// relies on (loadCampaignDetail below). Sums each missing campaign's ad
+// groups into one campaign-shaped metrics row. One adgroup_get + one report
+// call total, batched across every missing campaign_id for this advertiser.
+async function loadCampaignMetricsViaAdGroups(client, advertiserId, campaignIds, date) {
+  const advId = String(advertiserId);
+  const ids = [...new Set((campaignIds || []).map(String))].filter(Boolean);
+  if (!ids.length) return {};
+
+  const gRes = await mcpCall(client, "adgroup_get", {
+    advertiser_id: advId,
+    fields: ADGROUP_STATUS_FIELDS,
+    filtering: { campaign_ids: ids },
+    page_size: 1000,
+  });
+  const campaignByAdgroup = new Map();
+  for (const g of gRes?.list || []) {
+    const gid = String(g.adgroup_id || "");
+    const cid = String(g.campaign_id || "");
+    if (gid && cid) campaignByAdgroup.set(gid, cid);
+  }
+  if (!campaignByAdgroup.size) return {};
+
+  const sums = {}; // campaign_id -> running totals
+  let page = 1;
+  for (;;) {
+    const rep = await mcpCall(client, "report_integrated_get", {
+      report_type: "BASIC",
+      service_type: "AUCTION",
+      data_level: "AUCTION_ADGROUP",
+      advertiser_id: advId,
+      dimensions: ["adgroup_id"],
+      metrics: CAMPAIGN_METRIC_FIELDS,
+      start_date: date,
+      end_date: date,
+      filtering: [{ field_name: "campaign_ids", filter_type: "IN", filter_value: JSON.stringify(ids) }],
+      page,
+      page_size: 1000,
+    });
+    for (const row of rep?.list || []) {
+      const gid = String(row.dimensions?.adgroup_id || "");
+      const cid = campaignByAdgroup.get(gid);
+      if (!cid) continue;
+      const m = row.metrics || {};
+      const acc = sums[cid] || { spend: 0, impressions: 0, clicks: 0, conversions: 0 };
+      acc.spend += num(m.spend);
+      acc.impressions += num(m.impressions);
+      acc.clicks += num(m.clicks);
+      acc.conversions += num(m.conversion) || num(m.result);
+      sums[cid] = acc;
+    }
+    const info = rep?.page_info || {};
+    if (!info.total_page || page >= info.total_page) break;
+    page += 1;
+    if (page > 20) break; // safety
+  }
+
+  const byId = {};
+  for (const [cid, acc] of Object.entries(sums)) {
+    const spend = round2(acc.spend);
+    const impressions = Math.round(acc.impressions);
+    byId[cid] = {
+      advertiser_id: advId,
+      spend,
+      impressions,
+      clicks: Math.round(acc.clicks),
+      conversions: acc.conversions,
+      cpm: impressions > 0 ? round2((spend / impressions) * 1000) : 0,
+      cpa: acc.conversions > 0 ? round2(spend / acc.conversions) : 0,
+    };
+  }
+  return byId;
+}
+
 // -------- lazy: one campaign's live detail (row status + ad groups + today) --
 // Verifies nothing — the caller must confirm the campaign belongs to a tracked
 // advertiser first. Returns the freshly-derived campaign status AND the ad
@@ -1519,6 +1596,7 @@ module.exports = {
   applyAppealOverlayByCampaignId,
   deriveAdGroupStatus,
   loadCampaignMetricsForAdvertiser,
+  loadCampaignMetricsViaAdGroups,
   loadCampaignDetail,
   setCampaignStatus,
   setAdGroupStatus,
