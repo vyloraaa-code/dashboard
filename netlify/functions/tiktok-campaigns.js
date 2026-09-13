@@ -1081,7 +1081,13 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   const budgetBumps = {}; // campaign_id -> { budget, auto_budget_baseline, auto_budget_bumps }
 
   // Stay comfortably inside the function time limit even with many advertisers.
-  const DEADLINE_MS = 9000;
+  // Netlify's synchronous functions cap out around 10s, but this same code also
+  // runs on Vercel (see vercel.json's `maxDuration: 60` for api/[fn].js) — use
+  // most of that budget there instead of leaving most scoped advertisers
+  // unrefreshed every cycle (see scopedAdvertisers(): the scoped set grew once
+  // every advertiser with a rendered campaign row was included, not just the
+  // explicitly-`tracked` ones).
+  const DEADLINE_MS = process.env.VERCEL ? 45000 : 9000;
   const startedAt = Date.now();
   let timedOut = false;
 
