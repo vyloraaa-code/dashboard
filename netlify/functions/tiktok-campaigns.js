@@ -690,11 +690,12 @@ async function resolveTrackedAdvertiser(supabase, advertiserId) {
 // Advertisers whose campaigns are discovered/synced/metered for Detailed
 // Metrics: the legacy explicitly-`tracked` set (kept working for back-compat)
 // UNION any advertiser that has at least one Campaign Creator campaign
-// registered (campaign_creator_campaigns) — so campaigns created through
-// Campaign Creator show up automatically with no manual "tracked" step, without
-// pulling in every advertiser under every connected Business Center. Optional
-// `onlyConnectionId` scopes to one connection (mirrors the old tracked-only
-// queries' `onlyConnectionId` filtering in syncAll).
+// registered (campaign_creator_campaigns) UNION any advertiser that already
+// has a campaign row in tiktok_campaigns (so every campaign rendered in
+// Detailed Metrics also gets its spend/CPM/CPA metered — a campaign visible
+// in the table with no scoped advertiser behind it just sits at a permanent
+// $0 spend). Optional `onlyConnectionId` scopes to one connection (mirrors
+// the old tracked-only queries' `onlyConnectionId` filtering in syncAll).
 async function scopedAdvertisers(supabase, onlyConnectionId) {
   let advQ = supabase
     .from("tiktok_advertisers")
@@ -720,6 +721,25 @@ async function scopedAdvertisers(supabase, onlyConnectionId) {
     }
   } catch (_) {
     /* campaign_creator_campaigns not migrated yet — tracked-only is still safe */
+  }
+
+  // Any advertiser with a campaign already rendered in Detailed Metrics
+  // (tiktok_campaigns) must also be scoped for stats, or its row is stuck
+  // showing real affiliate clicks/earning next to a permanent $0 spend/CPM —
+  // metrics simply never requested for that account.
+  try {
+    let tcQ = supabase.from("tiktok_campaigns").select("connection_id, advertiser_id");
+    if (onlyConnectionId) tcQ = tcQ.eq("connection_id", onlyConnectionId);
+    const { data: tcRows } = await tcQ;
+    for (const r of tcRows || []) {
+      const key = `${r.connection_id}::${r.advertiser_id}`;
+      if (!byKey.has(key)) {
+        const a = advByKey.get(key);
+        if (a) byKey.set(key, a);
+      }
+    }
+  } catch (_) {
+    /* non-fatal — tracked/campaign_creator scoping still applies */
   }
 
   return [...byKey.values()];
