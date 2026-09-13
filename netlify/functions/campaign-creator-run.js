@@ -160,6 +160,7 @@ async function resources(supabase, body) {
   const deadline = Date.now() + 45000;
   let approvedSeen = 0;
   const formById = new Map(); // page_id -> { id, name, source: 'bc' | 'saved' }
+  let bcFormDiag = null;
 
   await withClient(supabase, conn, async (client) => {
     // BC-wide Instant Forms — the "BC -> Assets -> Forms" list. Forms linked to
@@ -191,6 +192,7 @@ async function resources(supabase, body) {
       try {
         const { forms, diag } = await listBcForms(client, { deadlineMs: deadline - 8000, cacheKey: String(connectionId) });
         for (const f of forms) if (!formById.has(f.id)) formById.set(f.id, { id: f.id, name: f.name, source: "bc" });
+        bcFormDiag = diag;
         if (diag && diag.errors && diag.errors.length) {
           console.warn(`[campaign-creator] form library scan: ${diag.libraries} libs, ${diag.withForms} with forms, ${diag.errors.length} error(s): ${diag.errors.slice(0, 3).join(" | ")}`);
         }
@@ -268,9 +270,16 @@ async function resources(supabase, body) {
     out.forms.sort((a, b) => String(a.name).localeCompare(String(b.name)));
     out.form_notes = [];
     if (approvedSeen && !out.forms.length) {
-      out.form_notes.push(
-        "No forms found automatically — paste your Instant Form ID below (the number in the form's URL). It's checked and remembered."
-      );
+      const permissionError = (bcFormDiag?.errors || []).find((e) => /permission/i.test(e));
+      if (permissionError) {
+        out.form_notes.push(
+          `TikTok denied access to your Business Center's form library (${permissionError.replace(/^.*?:\s*/, "")}). Paste your Instant Form ID below — it can still be validated per-account even when the library can't be listed.`
+        );
+      } else {
+        out.form_notes.push(
+          "No forms found automatically — paste your Instant Form ID below (the number in the form's URL). It's checked and remembered."
+        );
+      }
     }
   }
 
