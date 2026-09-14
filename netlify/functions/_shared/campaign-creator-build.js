@@ -862,6 +862,10 @@ async function createOneCampaign({
   form, // Lead Gen: { name, id? } — resolved to this advertiser's own form
   libraryId, // Lead Gen: this advertiser's BC form-library id (optional)
   cardImageUrl, // resolved public URL when interactive card enabled, else null
+  deadlineMs, // caller's overall request deadline — bounds mcpThrottled retries below
+  // so one rate-limited/flaky advertiser can't eat the whole batch's time budget
+  // and take the platform's hard function timeout (and every other advertiser's
+  // already-created results) down with it.
 }) {
   const advId = String(advertiser.advertiser_id);
   const tz = advertiser.timezone || advertiser.display_timezone || "America/New_York";
@@ -945,7 +949,7 @@ async function createOneCampaign({
   try {
     // 1. campaign
     const campPayload = buildCampaignPayload({ advertiserId: advId, campaignName, type, config });
-    const camp = await mcpThrottled(client, "campaign_create", campPayload);
+    const camp = await mcpThrottled(client, "campaign_create", campPayload, { deadlineMs });
     campaignId = String(camp?.campaign_id || "");
     if (!campaignId) throw new Error("campaign_create returned no campaign_id");
 
@@ -960,13 +964,13 @@ async function createOneCampaign({
     });
     let ag;
     try {
-      ag = await mcpThrottled(client, "adgroup_create", agPayload);
+      ag = await mcpThrottled(client, "adgroup_create", agPayload, { deadlineMs });
     } catch (err) {
       if (SCHEDULE_ERR.test(err.message || "")) {
         const soon = new Date(Date.now() + 5 * 60 * 1000);
         agPayload.schedule_start_time = toApiUtc(soon);
         scheduleLocal.localLabel = fmtLocal(soon, tz) + " (adjusted — chosen time was in the past)";
-        ag = await mcpThrottled(client, "adgroup_create", agPayload);
+        ag = await mcpThrottled(client, "adgroup_create", agPayload, { deadlineMs });
       } else {
         throw err;
       }
@@ -991,7 +995,7 @@ async function createOneCampaign({
       });
 
     const tryAd = async (fmt, withCard) =>
-      mcpThrottled(client, "ad_create", { advertiser_id: advId, adgroup_id: adgroupId, creatives: [makeCreative(fmt, withCard)] });
+      mcpThrottled(client, "ad_create", { advertiser_id: advId, adgroup_id: adgroupId, creatives: [makeCreative(fmt, withCard)] }, { deadlineMs });
 
     let ad;
     let usedCard = !!cardId;

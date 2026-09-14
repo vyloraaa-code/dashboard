@@ -479,6 +479,7 @@ async function createBatch(supabase, body) {
           form: type === "LEAD_GENERATION" ? { id: formId || null, name: formName || null } : null,
           libraryId: libMap.get(advId) || null,
           cardImageUrl,
+          deadlineMs: deadline,
         });
 
         // Store a minimal Detailed-Metrics row NOW carrying the post URL, so the
