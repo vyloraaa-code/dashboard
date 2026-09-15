@@ -182,11 +182,36 @@ async function readCampaigns(supabase) {
 // them). If the advertiser row itself is missing entirely, there's no
 // status/timezone to act with, so that case is still refused.
 async function resolveTrackedCampaign(supabase, campaignId) {
-  const { data: campaign } = await supabase
+  let { data: campaign } = await supabase
     .from("tiktok_campaigns")
     .select("*")
     .eq("campaign_id", String(campaignId))
     .maybeSingle();
+
+  // A WH Warmup (or stray) campaign can be visible in the "WHs Warming Up"
+  // panel without ever having a tiktok_campaigns row — e.g. its advertiser's
+  // last discoverAndStoreCampaigns pass ran before this campaign existed, or
+  // TikTok's campaign_get simply hasn't been re-polled for it yet. The panel
+  // still knows its campaign_id/advertiser_id/connection_id from its own
+  // tracking row, so fall back to those instead of refusing every action
+  // (pause/delete) with a confusing 404 for a campaign the user is staring
+  // right at.
+  if (!campaign) {
+    const { data: wh } = await supabase
+      .from("wh_warmup_campaigns")
+      .select("campaign_id, advertiser_id, connection_id, campaign_name")
+      .eq("campaign_id", String(campaignId))
+      .maybeSingle();
+    campaign = wh || null;
+  }
+  if (!campaign) {
+    const { data: stray } = await supabase
+      .from("stray_campaigns")
+      .select("campaign_id, advertiser_id, connection_id, campaign_name")
+      .eq("campaign_id", String(campaignId))
+      .maybeSingle();
+    campaign = stray || null;
+  }
   if (!campaign) return { error: json(404, { error: "Campaign not found. Run a campaign sync first." }) };
 
   const { data: adv } = await supabase
@@ -349,6 +374,11 @@ exports.handler = async function (event) {
             /* table optional */
           }
           try {
+            await supabase.from("wh_warmup_campaigns").delete().eq("campaign_id", campaignId);
+          } catch (_) {
+            /* table optional */
+          }
+          try {
             await supabase.from("stray_campaigns").delete().eq("campaign_id", campaignId);
           } catch (_) {
             /* table optional */
@@ -405,8 +435,21 @@ exports.handler = async function (event) {
       }
 
       // Real deletion succeeded — drop the row. A re-sync won't bring it back
-      // (campaign_get no longer returns deleted campaigns).
+      // (campaign_get no longer returns deleted campaigns). engagement_orders
+      // cascades via FK; campaign_creator_campaigns / wh_warmup_campaigns /
+      // stray_campaigns have no FK to tiktok_campaigns, so each needs its own
+      // explicit delete or it'd linger as a zombie row in its own panel.
       await supabase.from("tiktok_campaigns").delete().eq("campaign_id", campaignId);
+      try {
+        await supabase.from("campaign_creator_campaigns").delete().eq("campaign_id", campaignId);
+      } catch (_) {
+        /* table optional */
+      }
+      try {
+        await supabase.from("wh_warmup_campaigns").delete().eq("campaign_id", campaignId);
+      } catch (_) {
+        /* table optional */
+      }
       try {
         await supabase.from("stray_campaigns").delete().eq("campaign_id", campaignId);
       } catch (_) {
