@@ -1205,9 +1205,27 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   // to ignore report rows for campaigns we don't track, to satisfy the NOT
   // NULL columns when persisting, and (auto_budget_baseline/auto_budget_bumps)
   // as the running state for the auto budget-bump feature below.
-  const { data: known } = await supabase
-    .from("tiktok_campaigns")
-    .select("campaign_id, connection_id, advertiser_id, campaign_name, effective_status, auto_budget_baseline, auto_budget_bumps");
+  //
+  // IMPORTANT: this must never come back empty just because the optional
+  // auto_budget_bump.sql migration hasn't run — knownById gates EVERY row of
+  // the persist upsert below (`if (!k) continue`), so an empty map here means
+  // today_spend/today_clicks/... silently stop being written at all, with no
+  // error surfaced anywhere. Degrade the select instead of trusting it blind.
+  let known;
+  {
+    const res = await supabase
+      .from("tiktok_campaigns")
+      .select("campaign_id, connection_id, advertiser_id, campaign_name, effective_status, auto_budget_baseline, auto_budget_bumps");
+    if (res.error && /auto_budget_(bumps|baseline)/.test(res.error.message || "")) {
+      const fallback = await supabase
+        .from("tiktok_campaigns")
+        .select("campaign_id, connection_id, advertiser_id, campaign_name, effective_status");
+      known = fallback.data;
+    } else {
+      if (res.error) console.error(`[tiktok-metrics] "known" campaigns read failed: ${res.error.message}`);
+      known = res.data;
+    }
+  }
   const knownById = new Map((known || []).map((c) => [String(c.campaign_id), c]));
   const knownByAdvertiser = {};
   for (const c of known || []) {
