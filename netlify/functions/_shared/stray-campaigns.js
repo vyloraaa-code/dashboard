@@ -106,7 +106,31 @@ async function discoverStrayCampaigns({ supabase, client, connectionId }) {
       .in("advertiser_id", [...advertiserIdsToTrack]);
   }
 
-  if (campaignRows.length) {
+  // Write the stray_campaigns MARKER first, and only then the tiktok_campaigns
+  // row for whichever of these campaign_ids the marker write actually covers.
+  // A campaign_id must never land in tiktok_campaigns via this path without
+  // also being flagged in stray_campaigns — readCampaigns' is_stray check
+  // (tiktok-campaigns.js) is what keeps a stray out of Detailed Metrics, so
+  // writing tiktok_campaigns unconditionally (the old order) meant ANY
+  // failure of the stray_campaigns upsert — table not yet migrated, a
+  // transient error, anything — silently leaked that campaign into Detailed
+  // Metrics forever, unflagged, with a blank "Unknown" status. (Same failure
+  // shape as the WH Warmup Traffic-campaign leak fixed in cleanup.js.)
+  let markedIds = new Set();
+  if (strayRows.length) {
+    const { error } = await supabase.from("stray_campaigns").upsert(strayRows, { onConflict: "campaign_id" });
+    if (error) {
+      if (!/does not exist|schema cache|could not find/i.test(error.message || "")) out.errors.stray_campaigns = error.message;
+      // Table not migrated yet (or a real failure) — don't write ANY of these
+      // to tiktok_campaigns either; better invisible than unflagged.
+    } else {
+      out.strayCount = strayRows.length;
+      markedIds = new Set(strayRows.map((r) => r.campaign_id));
+    }
+  }
+
+  const coveredCampaignRows = campaignRows.filter((r) => markedIds.has(r.campaign_id));
+  if (coveredCampaignRows.length) {
     // Only the columns listed in campaignRows are ever written — today_spend,
     // effective_status, etc. are left completely alone (Postgres upsert only
     // sets columns you actually provide), so this never clobbers whatever the
@@ -115,16 +139,8 @@ async function discoverStrayCampaigns({ supabase, client, connectionId }) {
     // itself is computed by discoverAndStoreCampaigns, not here — a
     // brand-new stray reads with a blank status until the NEXT full sync,
     // which now includes it (its advertiser is tracked as of this run).
-    const { error } = await supabase.from("tiktok_campaigns").upsert(campaignRows, { onConflict: "campaign_id" });
+    const { error } = await supabase.from("tiktok_campaigns").upsert(coveredCampaignRows, { onConflict: "campaign_id" });
     if (error) out.errors.tiktok_campaigns = error.message;
-  }
-  if (strayRows.length) {
-    const { error } = await supabase.from("stray_campaigns").upsert(strayRows, { onConflict: "campaign_id" });
-    if (error) {
-      if (!/does not exist|schema cache|could not find/i.test(error.message || "")) out.errors.stray_campaigns = error.message;
-    } else {
-      out.strayCount = strayRows.length;
-    }
   }
 
   return out;
