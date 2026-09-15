@@ -102,15 +102,25 @@ async function readCampaigns(supabase) {
     });
   }
 
-  // Flag WH Warmup campaigns so the UI can show them in Detailed Metrics but keep
-  // them out of engagement (Add comments). They're excluded server-side too.
+  // Flag WH Warmup campaigns so the frontend can keep them out of Detailed
+  // Metrics (and out of engagement / Add comments). Primary signal: still
+  // present in wh_warmup_campaigns. Fallback: campaign_name matches WH
+  // Warmup's own auto-naming (`Traffic${4 digits}`, see _shared/wh-warmup.js
+  // whNames()) — catches a campaign whose wh_warmup_campaigns row is gone
+  // (e.g. purged as terminal by cleanup.js after its account got suspended
+  // and TikTok refused the delete) but the campaign itself is still alive on
+  // TikTok, which would otherwise leak it into Detailed Metrics forever.
+  const WH_NAME_RE = /^Traffic\d{4}$/;
   if (!res.error) {
     try {
       const { data: wh } = await supabase.from("wh_warmup_campaigns").select("campaign_id");
       const whIds = new Set((wh || []).map((r) => String(r.campaign_id)));
-      res.data = (res.data || []).map((c) => ({ ...c, is_wh_warmup: whIds.has(String(c.campaign_id)) }));
+      res.data = (res.data || []).map((c) => ({
+        ...c,
+        is_wh_warmup: whIds.has(String(c.campaign_id)) || WH_NAME_RE.test(String(c.campaign_name || "")),
+      }));
     } catch (_) {
-      res.data = (res.data || []).map((c) => ({ ...c, is_wh_warmup: false }));
+      res.data = (res.data || []).map((c) => ({ ...c, is_wh_warmup: WH_NAME_RE.test(String(c.campaign_name || "")) }));
     }
   }
 

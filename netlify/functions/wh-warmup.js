@@ -443,6 +443,21 @@ async function listWarmups(supabase) {
     /* table optional — not migrated yet */
   }
 
+  // A campaign_id can legitimately appear in both wh_warmup_campaigns and
+  // stray_campaigns (e.g. a sync ran in the narrow window before its warmup
+  // row was persisted, or before a cleanup-terminal warmup row's exclusion
+  // check saw it) — de-dup so the panel never shows the same campaign twice.
+  // "warmup" origin wins: it carries the real cleanup lifecycle/fields.
+  {
+    const byId = new Map();
+    for (const r of rows) {
+      const existing = byId.get(String(r.campaign_id));
+      if (!existing || (existing.origin === "stray" && r.origin === "warmup")) byId.set(String(r.campaign_id), r);
+    }
+    rows.length = 0;
+    rows.push(...byId.values());
+  }
+
   if (rows.length) {
     const ids = rows.map((r) => String(r.campaign_id));
     const { data: live } = await supabase

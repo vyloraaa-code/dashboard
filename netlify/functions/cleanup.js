@@ -41,14 +41,27 @@ exports.handler = async function (event) {
   const out = { ok: true, ny_date: nyToday, purged: {}, errors: {} };
 
   // 1. WH Warmup — terminal rows only. WAITING_FOR_ACTIVE / DELETE_PENDING are
-  //    never eligible (they're still being monitored).
-  await run(out, "wh_warmup_terminal", () =>
-    supabase
+  //    never eligible (they're still being monitored). A FAILED row (e.g. its
+  //    account got suspended, so TikTok refuses the delete — see
+  //    _shared/wh-warmup.js cleanupOneWarmup) still has a live tiktok_campaigns
+  //    row, kept flagged is_wh_warmup and hidden from Detailed Metrics ONLY
+  //    because this wh_warmup_campaigns row still exists (see readCampaigns in
+  //    tiktok-campaigns.js). Purging it here without also dropping the
+  //    tiktok_campaigns row would orphan that campaign into Detailed Metrics
+  //    forever, unflagged — so both are deleted together, same as the
+  //    already-DELETED-on-TikTok case does immediately in wh-warmup.js.
+  await run(out, "wh_warmup_terminal", async () => {
+    const { data: terminal, error: selErr } = await supabase
       .from("wh_warmup_campaigns")
-      .delete({ count: "exact" })
+      .select("campaign_id")
       .in("cleanup_status", ["DELETED", "FAILED"])
-      .lt("updated_at", isoAgo(WH_TERMINAL_DAYS * day))
-  );
+      .lt("updated_at", isoAgo(WH_TERMINAL_DAYS * day));
+    if (selErr) return { error: selErr };
+    const ids = (terminal || []).map((r) => r.campaign_id);
+    if (!ids.length) return { count: 0 };
+    await supabase.from("tiktok_campaigns").delete().in("campaign_id", ids);
+    return supabase.from("wh_warmup_campaigns").delete({ count: "exact" }).in("campaign_id", ids);
+  });
 
   // 2. engagement_orders — finished operational records. READY / SUBMITTED
   //    (pending) are kept. A future comment-TEMPLATE feature is a separate
@@ -101,6 +114,13 @@ exports.handler = async function (event) {
       )
       .not("today_date", "is", null)
       .neq("today_date", nyToday)
+  );
+
+  // 6. Dismissed ghost sources (Detailed Metrics rows with only affiliate
+  //    clicks, no matching TikTok campaign) — a dismissal only ever applies to
+  //    its own NY date, so anything older is dead weight.
+  await run(out, "dismissed_sources", () =>
+    supabase.from("dismissed_sources").delete({ count: "exact" }).lt("dismiss_date", dateAgo(2 * day))
   );
 
   return {
