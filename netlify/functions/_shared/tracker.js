@@ -169,11 +169,16 @@ async function populateTrackerTests(supabase, targetDate) {
       continue;
     }
 
+    const spend = Number(tk.spend) || 0;
+    if (spend <= 0) {
+      out.skipped++; // campaign existed that day but never actually spent — not a real test, don't clutter Tracker
+      continue;
+    }
+
     const network = netById.get(cid) || "GLITCHY";
     const aff = network === "MABAC" ? mabacBySub1[cc.campaign_name] : glitchyBySource[cc.campaign_name];
     const clicks = aff ? Number(aff.clicks) || 0 : 0;
     const payout = aff ? Number(network === "MABAC" ? aff.revenue : aff.payout) || 0 : 0;
-    const spend = Number(tk.spend) || 0;
 
     const roas = round4(ratio(payout, spend));
     const cardId = cc.ad_payload && typeof cc.ad_payload === "object" ? cc.ad_payload.card_id : null;
@@ -182,6 +187,7 @@ async function populateTrackerTests(supabase, targetDate) {
       campaign_id: cid,
       sn: cc.campaign_name || cid,
       type: cardId ? "VIDEOS" : "SLIDES",
+      spend: round2(spend),
       cpa: round2(tk.cpa),
       cpnc: round2(ratio(spend, clicks)),
       epc: round2(ratio(payout, clicks)),
@@ -193,7 +199,14 @@ async function populateTrackerTests(supabase, targetDate) {
   }
 
   if (upserts.length) {
-    const { error } = await supabase.from("tracker_tests").upsert(upserts, { onConflict: "campaign_id" });
+    let { error } = await supabase.from("tracker_tests").upsert(upserts, { onConflict: "campaign_id" });
+    if (error && /spend/.test(error.message || "") && /column .* does not exist|schema cache/i.test(error.message || "")) {
+      // Not migrated yet (supabase/tracker.sql) — retry without it so the rest
+      // of the row still gets recorded; spend-based filtering just falls back
+      // to "show everything" until the migration runs.
+      const bare = upserts.map(({ spend, ...r }) => r);
+      ({ error } = await supabase.from("tracker_tests").upsert(bare, { onConflict: "campaign_id" }));
+    }
     if (error) out.errors.upsert = error.message;
     else out.upserted = upserts.length;
   }

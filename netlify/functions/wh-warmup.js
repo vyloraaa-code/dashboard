@@ -77,7 +77,7 @@ exports.handler = async function (event) {
 
     if (body.action === "create") return createBatch(supabase, body);
     if (body.action === "cleanup") return cleanupBatch(supabase);
-    if (body.action === "list") return listWarmups(supabase);
+    if (body.action === "list") return listWarmups(supabase, body.connection_id || null);
     if (body.action === "countries") return countriesFor(supabase, body);
     if (body.action === "template_countries") return templateCountries(supabase);
 
@@ -154,6 +154,14 @@ async function templateCountries(supabase) {
 async function createBatch(supabase, body) {
   const connectionId = body.connection_id;
   const advertiserIds = [...new Set((body.advertiser_ids || []).map(String).filter(Boolean))];
+  // Optional, same length/order as advertiserIds — see js/api.js createWhWarmup.
+  // A large batch arrives as several chunked requests (js/app.js
+  // submitWhWarmup, mirroring Campaign Creator's own chunking), each covering
+  // a slice of the full account list; without an explicit name per account,
+  // deriving "wh${i+1}" from THIS request's own array position would restart
+  // at wh1 on every chunk and collide with an earlier one's names. Falls back
+  // to that same derivation when omitted (e.g. a single-chunk batch).
+  const campaignNames = Array.isArray(body.campaign_names) ? body.campaign_names.map(String) : null;
   const targetCountry = String(body.target_country || "").trim();
   const locationId = String(body.location_id || "").trim() || null;
   const rawSpark = String(body.spark_code || "");
@@ -185,14 +193,34 @@ async function createBatch(supabase, body) {
   const results = [];
   let storeWarning = null;
 
+  // Second layer of defense on top of the frontend's own chunking (see
+  // js/app.js submitWhWarmup, mirroring Campaign Creator's create action /
+  // its matching frontend chunk size) — if a chunk still runs long (a slow
+  // TikTok API day), the remaining accounts in THIS request come back
+  // Skipped with a clear retry message instead of the whole request hard
+  // timing out with no response at all.
+  const deadline = Date.now() + 52000;
+
   await withClient(supabase, conn, async (client) => {
     for (let i = 0; i < advertiserIds.length; i++) {
       const advId = advertiserIds[i];
+      if (Date.now() > deadline) {
+        const name = advById.get(advId)?.advertiser_name || advId;
+        results.push({
+          advertiser_id: advId,
+          advertiser_name: name,
+          status: "Skipped",
+          error: "This request ran out of time — the dashboard should have sent it in a smaller batch; retry to create the rest.",
+        });
+        continue;
+      }
       // wh1, wh2, … by POSITION in advertiserIds — the dashboard sends this
       // list already ordered to match the ad-accounts list (see
       // js/app.js submitWhWarmup), so this numbering always lines up with
       // what's shown on screen, independent of which accounts get skipped.
-      const campaignName = `wh${i + 1}`;
+      // campaignNames[i], when the caller sent it, overrides this with the
+      // GLOBAL position across a multi-chunk batch (see the comment above).
+      const campaignName = campaignNames?.[i] || `wh${i + 1}`;
       const adv = advById.get(advId);
       const name = adv?.advertiser_name || advId;
       if (!adv) {
@@ -393,15 +421,22 @@ async function patchRow(supabase, campaignId, patch) {
 // Also joins in each campaign's live on/off + status from tiktok_campaigns
 // (the same columns Detailed Metrics reads) so the panel can show on/off and
 // status without a second round trip.
-async function listWarmups(supabase) {
-  const { data, error } = await supabase
+// `connectionId` (optional): scopes the list to one Business Center — the
+// "WHs Warming Up" box lives right under the BC selector in the WH Warmup
+// creator (js/app.js openWhWarmingUpModal passes whState.connectionId), so
+// it should only ever count/show that same BC's campaigns, not every
+// connected BC's mixed together. Omit it for the unscoped view.
+async function listWarmups(supabase, connectionId) {
+  let warmupQ = supabase
     .from("wh_warmup_campaigns")
     .select(
-      "campaign_id, advertiser_id, advertiser_name, campaign_name, target_country, daily_budget, currency, cleanup_status, cleanup_attempts, cleanup_error, became_active_at, deleted_at, created_at"
+      "campaign_id, advertiser_id, advertiser_name, campaign_name, target_country, daily_budget, currency, cleanup_status, cleanup_attempts, cleanup_error, became_active_at, deleted_at, created_at, connection_id"
     )
     .in("cleanup_status", ["WAITING_FOR_ACTIVE", "PAUSE_PENDING", "DELETE_PENDING"])
     .order("created_at", { ascending: false })
     .limit(200);
+  if (connectionId) warmupQ = warmupQ.eq("connection_id", connectionId);
+  const { data, error } = await warmupQ;
   if (error) {
     if (/does not exist|schema cache|could not find the table/i.test(error.message || "")) {
       return json(200, { ok: true, campaigns: [], unmigrated: true });
@@ -416,11 +451,13 @@ async function listWarmups(supabase) {
   // auto-deleted. No WH-specific fields (target_country/daily_budget/
   // cleanup_status) — those stay null so the frontend can tell them apart.
   try {
-    const { data: strays } = await supabase
+    let strayQ = supabase
       .from("stray_campaigns")
-      .select("campaign_id, advertiser_id, campaign_name, discovered_at")
+      .select("campaign_id, advertiser_id, campaign_name, discovered_at, connection_id")
       .order("discovered_at", { ascending: false })
       .limit(200);
+    if (connectionId) strayQ = strayQ.eq("connection_id", connectionId);
+    const { data: strays } = await strayQ;
     for (const s of strays || []) {
       rows.push({
         campaign_id: s.campaign_id,

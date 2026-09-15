@@ -17,9 +17,16 @@
 //        "set_adgroup_status"  : { campaign_id, adgroup_id, operation_status } — write
 //        "set_post_url"       : { campaign_id, tiktok_post_url } — set/clear a campaign's
 //                                TikTok post URL (validated https tiktok.com link; no external calls)
-//        "queue_engagement_comments": { campaign_id, service_id, comments } — store a comment
-//                                batch (against the campaign's tiktok_post_url) as an
-//                                engagement_orders row. NEVER contacts an SMM service.
+//        "queue_engagement_comments": { campaign_ids (or legacy campaign_id), service_id, comments }
+//                                — one comment batch (same template/service id) per
+//                                campaign, against each campaign's own tiktok_post_url.
+//                                -> { results: [{ campaign_id, ok, message, ... }] }
+//        "queue_engagement_manual" : { campaign_ids, likes_quantity?, saves_quantity? } —
+//                                on-demand LIKES/SAVES push, bypassing the auto-trigger's
+//                                own state machine entirely (a fallback for campaigns it
+//                                missed). -> { results: [{ campaign_id, ok, likes?, saves? }] }
+//        "engagement_defaults" : current LIKES/SAVES panel quantity + configured flag,
+//                                so the UI can pre-fill "default = what auto-engagement uses"
 //
 // None of these need the admin password. Discovery/sync/metrics/budgets and
 // every per-campaign write are restricted server-side to "scoped" advertiser
@@ -55,7 +62,7 @@ const {
   json,
 } = require("./_shared/tiktok-mcp");
 const { tiktokSpendForToday } = require("./_shared/glitchy-daily");
-const { submitEngagementOrder, parseComments } = require("./_shared/engagement-provider");
+const { submitEngagementOrder, parseComments, configFor } = require("./_shared/engagement-provider");
 const { groupReasonsByCategory } = require("./_shared/appeals.js");
 const { applyAutoBudgetBumps } = require("./_shared/auto-budget-bump");
 const { discoverStrayCampaigns } = require("./_shared/stray-campaigns");
@@ -500,10 +507,14 @@ exports.handler = async function (event) {
     if (action === "set_advertiser_budget") {
       if (!body.advertiser_id) return json(400, { error: "advertiser_id is required" });
       const mode = String(body.budget_mode || "").toUpperCase();
-      const allowed = ["UNLIMITED", "MONTHLY_BUDGET", "DAILY_BUDGET", "CUSTOM_BUDGET"];
+      // ONE_CLICK_MINIMUM: our own sentinel (not a TikTok value) for "set the
+      // cap to whatever minimum TikTok itself allows above current spend" —
+      // see setAdvertiserBudget. No amount needed; TikTok computes it.
+      const allowed = ["UNLIMITED", "MONTHLY_BUDGET", "DAILY_BUDGET", "CUSTOM_BUDGET", "ONE_CLICK_MINIMUM"];
       if (!allowed.includes(mode)) return json(400, { error: `budget_mode must be one of ${allowed.join(", ")}` });
       const amount = Number(body.budget);
-      if (mode !== "UNLIMITED" && !(amount > 0)) return json(400, { error: "budget must be a positive number" });
+      if (mode !== "UNLIMITED" && mode !== "ONE_CLICK_MINIMUM" && !(amount > 0))
+        return json(400, { error: "budget must be a positive number" });
 
       const r = await resolveTrackedAdvertiser(supabase, body.advertiser_id);
       if (r.error) return r.error;
@@ -576,83 +587,59 @@ exports.handler = async function (event) {
     }
 
     if (action === "queue_engagement_comments") {
-      if (!body.campaign_id) return json(400, { error: "campaign_id is required" });
-      const r = await resolveTrackedCampaign(supabase, body.campaign_id);
-      if (r.error) return r.error;
-      if (!(await withoutTemporaryCampaigns(supabase, [String(body.campaign_id)])).length) {
-        return json(400, { error: "WH Warmup campaigns can't be used for engagement." });
-      }
-
-      const link = (r.campaign.tiktok_post_url || "").trim();
-      if (!link) {
-        return json(400, {
-          error: "This campaign has no TikTok post URL yet. It is set automatically when the campaign is created.",
-        });
-      }
+      const ids = normalizeCampaignIds(body.campaign_ids, body.campaign_id);
+      if (!ids.length) return json(400, { error: "campaign_id(s) required" });
 
       const comments = parseComments(body.comments);
-      if (!comments.length) {
-        return json(400, { error: "Enter at least one comment (one per line)." });
-      }
+      if (!comments.length) return json(400, { error: "Enter at least one comment (one per line)." });
       const serviceId = typeof body.service_id === "string" ? body.service_id.trim() : "";
-      if (!serviceId) {
-        return json(400, { error: "Service ID is required." });
-      }
+      if (!serviceId) return json(400, { error: "Service ID is required." });
 
-      // Store the batch first (so a provider failure still leaves a record).
-      const orderRow = {
-        campaign_id: String(r.campaign.campaign_id),
-        kind: "COMMENTS",
-        provider: null,
-        service_id: serviceId,
-        link,
-        quantity: comments.length,
-        comments,
-        status: "READY",
-        note: null,
-        updated_at: new Date().toISOString(),
-      };
-      const ins = await supabase.from("engagement_orders").insert(orderRow).select().maybeSingle();
-      if (ins.error && /does not exist|schema cache|could not find the table/i.test(ins.error.message || "")) {
-        return json(500, {
-          error: "The engagement_orders table isn't migrated yet. Run supabase/tiktok_engagement.sql, then retry.",
-          details: ins.error.message,
-        });
-      }
-      if (ins.error) return json(500, { error: "Could not store the comment batch", details: ins.error.message });
+      // Fired in parallel, not one-at-a-time: each call is a round trip to an
+      // external panel, and a serial await-in-a-loop over a real batch (10+
+      // campaigns) reliably outran Netlify's function time limit, killing the
+      // whole request with a 504 after only the first campaign or two had
+      // actually gone through (see queue_engagement_manual below for the same
+      // fix and the full story).
+      const results = await Promise.all(ids.map((cid) => queueCommentsForOne(supabase, cid, serviceId, comments)));
+      return json(200, { ok: true, results });
+    }
 
-      // Dispatch to the COMMENTS provider (DripFeedPanel) using the modal's
-      // Service ID. With no ENGAGEMENT_COMMENTS_API_KEY this is stored-only.
-      const result = await submitEngagementOrder({
-        kind: "COMMENTS",
-        campaignId: String(r.campaign.campaign_id),
-        serviceId,
-        link,
-        quantity: comments.length,
-        comments,
-      });
+    // Manual fallback for LIKES / SAVES — the same panels the ~60s auto-trigger
+    // uses (see _shared/engagement-provider.js), fired on demand instead of
+    // waiting on that lifecycle. Bypasses the auto system's own idempotency
+    // latch/attempt-cap entirely: this is an explicit "place it now" action, so
+    // a campaign the auto-trigger already gave up on (or hasn't reached yet)
+    // can still be pushed through by hand. { campaign_ids, likes_quantity?,
+    // saves_quantity? } — a 0/omitted quantity skips that kind for every
+    // campaign in the batch.
+    if (action === "queue_engagement_manual") {
+      const ids = normalizeCampaignIds(body.campaign_ids, body.campaign_id);
+      if (!ids.length) return json(400, { error: "campaign_id(s) required" });
+      const likesQty = Math.max(0, Math.floor(Number(body.likes_quantity) || 0));
+      const savesQty = Math.max(0, Math.floor(Number(body.saves_quantity) || 0));
+      if (!likesQty && !savesQty) return json(400, { error: "Enter a Likes and/or Saves quantity." });
 
-      if (ins.data) {
-        await supabase
-          .from("engagement_orders")
-          .update({
-            status: result.status || "READY",
-            provider: result.provider || null,
-            provider_ref: result.providerRef || null,
-            note: result.message || null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", ins.data.id);
-      }
+      // Parallel, not serial — see the comment on queue_engagement_comments
+      // above. A batch of N campaigns here means up to 2N sequential external
+      // HTTP round trips (LIKES then SAVES, one campaign at a time) inside a
+      // single function invocation; that's exactly what was blowing past
+      // Netlify's execution limit and coming back as a bare 504 with only
+      // the first campaign or two actually placed.
+      const results = await Promise.all(ids.map((cid) => queueManualForOne(supabase, cid, { likesQty, savesQty })));
+      return json(200, { ok: true, results });
+    }
 
+    // Read-only: current LIKES/SAVES panel defaults (quantity + whether an API
+    // key is configured for that kind), so the Engagement modal can pre-fill
+    // "default = whatever auto-engagement currently uses." No secrets returned.
+    if (action === "engagement_defaults") {
+      const likes = configFor("LIKES");
+      const saves = configFor("SAVES");
       return json(200, {
         ok: true,
-        order_id: ins.data ? ins.data.id : null,
-        count: comments.length,
-        submitted: !!result.submitted,
-        status: result.status || "READY",
-        provider_ref: result.providerRef || null,
-        message: result.message || "Stored locally — ready for an approved provider integration.",
+        likes: { quantity: likes.quantity, configured: !!likes.apiKey },
+        saves: { quantity: saves.quantity, configured: !!saves.apiKey },
       });
     }
 
@@ -663,6 +650,157 @@ exports.handler = async function (event) {
     return json(500, { error: "Request failed", details: err.message });
   }
 };
+
+// Accepts either the new `campaign_ids` (array) or the legacy single
+// `campaign_id` param, returns a deduped array of string ids either way.
+function normalizeCampaignIds(campaignIds, campaignId) {
+  const raw = Array.isArray(campaignIds) ? campaignIds : campaignId != null ? [campaignId] : [];
+  return [...new Set(raw.map((v) => String(v || "").trim()).filter(Boolean))];
+}
+
+// resolveTrackedCampaign's `error` is a full { statusCode, body } response
+// (built for handlers that return it straight through). The batch helpers
+// below instead fold it into a per-campaign result row, so this pulls the
+// real "Campaign not found. Run a campaign sync first." / "That advertiser
+// account is not tracked." text back out instead of flattening every reason
+// into one generic, undebuggable message.
+function trackedErrorMessage(r) {
+  try {
+    return JSON.parse(r.error.body).error || "Campaign not found or not tracked.";
+  } catch (_) {
+    return "Campaign not found or not tracked.";
+  }
+}
+
+// One campaign's COMMENTS batch — same template/service id, this campaign's
+// own tiktok_post_url. Never throws; every failure comes back as a per-
+// campaign { ok:false, error } entry so a batch of many never aborts on one
+// bad row (e.g. a campaign missing its post URL).
+async function queueCommentsForOne(supabase, campaignId, serviceId, comments) {
+  const cid = String(campaignId);
+  const r = await resolveTrackedCampaign(supabase, cid);
+  if (r.error) return { campaign_id: cid, ok: false, error: trackedErrorMessage(r) };
+  if (!(await withoutTemporaryCampaigns(supabase, [cid])).length) {
+    return { campaign_id: cid, ok: false, error: "WH Warmup campaigns can't be used for engagement." };
+  }
+  const link = (r.campaign.tiktok_post_url || "").trim();
+  if (!link) {
+    return { campaign_id: cid, ok: false, error: "This campaign has no TikTok post URL yet." };
+  }
+
+  const orderRow = {
+    campaign_id: cid,
+    kind: "COMMENTS",
+    provider: null,
+    service_id: serviceId,
+    link,
+    quantity: comments.length,
+    comments,
+    status: "READY",
+    note: null,
+    updated_at: new Date().toISOString(),
+  };
+  const ins = await supabase.from("engagement_orders").insert(orderRow).select().maybeSingle();
+  if (ins.error && /does not exist|schema cache|could not find the table/i.test(ins.error.message || "")) {
+    return { campaign_id: cid, ok: false, error: "engagement_orders isn't migrated yet — run supabase/tiktok_engagement.sql." };
+  }
+  if (ins.error) return { campaign_id: cid, ok: false, error: `Could not store the comment batch: ${ins.error.message}` };
+
+  const result = await submitEngagementOrder({ kind: "COMMENTS", campaignId: cid, serviceId, link, quantity: comments.length, comments });
+
+  if (ins.data) {
+    await supabase
+      .from("engagement_orders")
+      .update({
+        status: result.status || "READY",
+        provider: result.provider || null,
+        provider_ref: result.providerRef || null,
+        note: result.message || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", ins.data.id);
+  }
+
+  return {
+    campaign_id: cid,
+    ok: true,
+    order_id: ins.data ? ins.data.id : null,
+    count: comments.length,
+    submitted: !!result.submitted,
+    status: result.status || "READY",
+    provider_ref: result.providerRef || null,
+    message: result.message || "Stored locally — ready for an approved provider integration.",
+  };
+}
+
+// One campaign's manual LIKES/SAVES push — deliberately independent of the
+// auto-trigger's own state machine (ensureAutoOrder in _shared/tiktok-mcp.js),
+// since this exists specifically to cover campaigns the auto path missed or
+// gave up on. LIKES/SAVES have at most one row per campaign (a partial unique
+// index — see supabase/engagement_orders_auto.sql), so this reuses that row
+// if the auto-trigger already created one (any prior PENDING/FAILED attempt
+// is simply overwritten with this fresh push) instead of inserting a
+// duplicate, which would violate that constraint.
+async function queueManualForOne(supabase, campaignId, { likesQty, savesQty }) {
+  const cid = String(campaignId);
+  const r = await resolveTrackedCampaign(supabase, cid);
+  if (r.error) return { campaign_id: cid, ok: false, error: trackedErrorMessage(r) };
+  if (!(await withoutTemporaryCampaigns(supabase, [cid])).length) {
+    return { campaign_id: cid, ok: false, error: "WH Warmup campaigns can't be used for engagement." };
+  }
+  const link = (r.campaign.tiktok_post_url || "").trim();
+  if (!link) {
+    return { campaign_id: cid, ok: false, error: "This campaign has no TikTok post URL yet." };
+  }
+
+  // LIKES and SAVES are independent rows (the partial unique index is on
+  // (campaign_id, kind)), so they're placed in parallel — two sequential
+  // panel round trips per campaign was half of what turned a 12-campaign
+  // batch into a 504 (see the comment on queue_engagement_manual above).
+  const out = { campaign_id: cid, ok: true };
+  const kinds = [["LIKES", likesQty], ["SAVES", savesQty]].filter(([, qty]) => qty);
+  const settled = await Promise.all(
+    kinds.map(async ([kind, qty]) => {
+      const { data: existing } = await supabase
+        .from("engagement_orders")
+        .select("id")
+        .eq("campaign_id", cid)
+        .eq("kind", kind)
+        .maybeSingle();
+
+      const row = { campaign_id: cid, kind, provider: null, link, quantity: qty, status: "PENDING", note: null, updated_at: new Date().toISOString() };
+      let rowId = existing ? existing.id : null;
+      if (rowId) {
+        const { error } = await supabase.from("engagement_orders").update(row).eq("id", rowId);
+        if (error) return [kind, { ok: false, error: error.message }];
+      } else {
+        const ins = await supabase.from("engagement_orders").insert(row).select("id").maybeSingle();
+        if (ins.error) return [kind, { ok: false, error: ins.error.message }];
+        rowId = ins.data ? ins.data.id : null;
+      }
+
+      const result = await submitEngagementOrder({ kind, campaignId: cid, link, quantity: qty });
+      if (rowId) {
+        await supabase
+          .from("engagement_orders")
+          .update({
+            status: result.status || "READY",
+            provider: result.provider || null,
+            provider_ref: result.providerRef || null,
+            note: result.message || null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", rowId);
+      }
+      return [kind, { ok: !!result.ok, submitted: !!result.submitted, message: result.message }];
+    })
+  );
+  for (const [kind, res] of settled) {
+    out[kind.toLowerCase()] = res;
+    if (!res.ok) out.ok = false;
+  }
+  return out;
+}
 
 // Confirms an advertiser account is ours to manage (tracked, OR it has at
 // least one Campaign Creator campaign registered) and returns its connection
@@ -774,30 +912,43 @@ async function budgetsForScopedAdvertisers(supabase) {
   const advertisers = {};
   const bc = {}; // bc_id -> { balance, currency, connection_id, bc_name }
 
-  for (const [connectionId, list] of Object.entries(byConnection)) {
-    const { data: conn } = await supabase.from("tiktok_connections").select("*").eq("id", connectionId).maybeSingle();
-    if (!conn) continue;
-    const bcIds = [...new Set(list.map((t) => t.bc_id || conn.bc_id).filter(Boolean))];
-    if (!bcIds.length) continue;
+  // Every connection, and every BC within it, fetched in parallel. This used
+  // to run one BC at a time — sequentially, even across DIFFERENT connections
+  // — so with more than a handful of Business Centers it reliably outran
+  // Netlify's function time limit. The request then died with no JSON body
+  // at all, which the frontend's catch-and-ignore (see loadTiktokBudgets in
+  // js/app.js) turned into a permanently blank Budget column: the only thing
+  // that ever populated it was the unrelated side effect of editing one
+  // account's cap, which stores THAT account's fresh number straight from
+  // the edit response.
+  await Promise.all(
+    Object.entries(byConnection).map(async ([connectionId, list]) => {
+      const { data: conn } = await supabase.from("tiktok_connections").select("*").eq("id", connectionId).maybeSingle();
+      if (!conn) return;
+      const bcIds = [...new Set(list.map((t) => t.bc_id || conn.bc_id).filter(Boolean))];
+      if (!bcIds.length) return;
 
-    const provider = new SupabaseOAuthProvider({ supabase, serverUrl, redirectUrl, connection: conn });
-    let client;
-    try {
-      ({ client } = await connectMcp({ provider, serverUrl }));
-      for (const bcId of bcIds) {
-        const [bal, budgets] = await Promise.all([
-          getBcBalance({ client, bcId }),
-          getAdvertiserBudgets({ client, bcId }),
-        ]);
-        bc[bcId] = { bc_id: bcId, bc_name: conn.bc_name || null, connection_id: connectionId, ...bal };
-        for (const [advId, b] of Object.entries(budgets.byId || {})) advertisers[advId] = { ...b, bc_id: bcId };
+      const provider = new SupabaseOAuthProvider({ supabase, serverUrl, redirectUrl, connection: conn });
+      let client;
+      try {
+        ({ client } = await connectMcp({ provider, serverUrl }));
+        await Promise.all(
+          bcIds.map(async (bcId) => {
+            const [bal, budgets] = await Promise.all([
+              getBcBalance({ client, bcId }),
+              getAdvertiserBudgets({ client, bcId }),
+            ]);
+            bc[bcId] = { bc_id: bcId, bc_name: conn.bc_name || null, connection_id: connectionId, ...bal };
+            for (const [advId, b] of Object.entries(budgets.byId || {})) advertisers[advId] = { ...b, bc_id: bcId };
+          })
+        );
+      } catch (err) {
+        bc[`err:${connectionId}`] = { error: err.message };
+      } finally {
+        if (client) await client.close().catch(() => {});
       }
-    } catch (err) {
-      bc[`err:${connectionId}`] = { error: err.message };
-    } finally {
-      if (client) await client.close().catch(() => {});
-    }
-  }
+    })
+  );
 
   return json(200, { advertisers, bc });
 }
@@ -1089,6 +1240,7 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   const errors = {};
   const okAdvertiserIds = [];
   const budgetBumps = {}; // campaign_id -> { budget, auto_budget_baseline, auto_budget_bumps }
+  const trueSpendByHour = {}; // "<hour>" -> spend, summed across every advertiser this cycle (Live Performance graph)
 
   // Stay comfortably inside the function time limit even with many advertisers.
   // Netlify's synchronous functions cap out around 10s, but this same code also
@@ -1132,7 +1284,10 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
           console.warn(`[tiktok-metrics] advertiser ${advId} tz="${tz}" — daily boundary uses the NY date, near-midnight skew possible`);
         }
         try {
-          const byId = await loadCampaignMetricsForAdvertiser(client, advId, { date });
+          const { byId, byHour: advByHour } = await loadCampaignMetricsForAdvertiser(client, advId, {
+            date,
+            withHourly: true,
+          });
 
           // TikTok's AUCTION_CAMPAIGN report occasionally omits a row for a
           // campaign we know is active (seen on some auto/Smart+-style
@@ -1152,6 +1307,7 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
           }
 
           for (const [cid, m] of Object.entries(byId)) metrics[cid] = m;
+          for (const [h, v] of Object.entries(advByHour)) trueSpendByHour[h] = (trueSpendByHour[h] || 0) + v;
           okAdvertiserIds.push(advId);
 
           // Auto budget-bump: +$50 to a CBO campaign's budget for every $10 it
@@ -1212,18 +1368,50 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
     }
   }
 
-  // ---- Live Performance graph ONLY: snapshot today's cumulative spend into the
-  // current NY hour, then hand back every hour's cumulative so the frontend can
-  // derive hourly spend (delta between consecutive snapshots). Zero extra MCP
-  // calls — this is all Supabase. Never fails the response.
-  let spendToday = null;
-  try {
-    const cumulative = await tiktokSpendForToday(supabase, date); // Σ persisted today_spend
-    const hour = nyHourNow();
-    await recordSpendSnapshot(supabase, date, hour, cumulative);
-    spendToday = { date, currentHour: hour, cumulative, byHour: await readSpendSnapshots(supabase, date) };
-  } catch (err) {
-    console.error(`[tiktok-metrics] spend snapshot failed: ${err.message}`);
+  // ---- Live Performance graph ONLY: turn this cycle's TRUE per-hour spend
+  // (trueSpendByHour, from TikTok's own stat_time_hour breakdown — see
+  // loadCampaignMetricsForAdvertiser) into a cumulative-by-hour series. This
+  // replaces the old approach of polling a running total and snapshotting it
+  // into "whichever hour we happened to be polling" — that attributed a
+  // whole burst of spend to the poll that first noticed it, not to the hour
+  // it actually happened in (and could disagree with the Earnings line by an
+  // hour or more purely from polling timing, independent of any real delay
+  // between spend and conversion). This is TikTok's own attribution, so it's
+  // accurate regardless of when/how often this endpoint gets polled. No
+  // history is backfilled for hours before this change shipped — those stay
+  // at $0 for today only; a fresh day starts clean.
+  const hour = nyHourNow();
+  let spendToday;
+  const totalSpendThisCycle = Object.values(metrics).reduce((a, m) => a + (Number(m.spend) || 0), 0);
+  if (Object.keys(trueSpendByHour).length > 0 || totalSpendThisCycle <= 0) {
+    const cumulativeByHour = {};
+    let running = 0;
+    for (let h = 0; h <= hour && h < 24; h++) {
+      running += Number(trueSpendByHour[h] ?? trueSpendByHour[String(h)] ?? 0);
+      cumulativeByHour[String(h)] = Math.round(running * 100) / 100;
+    }
+    spendToday = { date, currentHour: hour, cumulative: cumulativeByHour[String(hour)] ?? 0, byHour: cumulativeByHour };
+  } else {
+    // Safety net: there IS real spend this cycle but stat_time_hour parsing
+    // came back completely empty (TikTok's exact hour-dimension string format
+    // isn't documented, so hourFromStatTimeHour's assumption could be wrong
+    // for this account/report). Rather than show a flat $0 line all day, fall
+    // back to the old cumulative-total-snapshot approach so the graph still
+    // shows SOMETHING, just without per-hour precision this cycle.
+    console.error("[tiktok-metrics] stat_time_hour produced no hours despite real spend — falling back to cumulative snapshot");
+    const cumulative = await tiktokSpendForToday(supabase, date);
+    try {
+      await recordSpendSnapshot(supabase, date, hour, cumulative);
+    } catch (err) {
+      console.error(`[tiktok-metrics] spend snapshot write failed: ${err.message}`);
+    }
+    let byHourFallback = {};
+    try {
+      byHourFallback = await readSpendSnapshots(supabase, date);
+    } catch (err) {
+      console.error(`[tiktok-metrics] spend snapshot read failed: ${err.message}`);
+    }
+    spendToday = { date, currentHour: hour, cumulative, byHour: byHourFallback };
   }
 
   return json(200, { ok: true, date, metrics, okAdvertiserIds, errors, spendToday, budgetBumps });
@@ -1259,7 +1447,13 @@ async function readSpendSnapshots(supabase, date) {
     .from("tiktok_spend_snapshots")
     .select("hour, cumulative_spend")
     .eq("date", date);
-  if (error || !Array.isArray(data)) return {};
+  if (error) {
+    if (!/tiktok_spend_snapshots|does not exist|schema cache/i.test(error.message || "")) {
+      console.error(`[readSpendSnapshots] query failed: ${error.message}`);
+    }
+    return {};
+  }
+  if (!Array.isArray(data)) return {};
   const byHour = {};
   for (const r of data) byHour[String(r.hour)] = Number(r.cumulative_spend) || 0;
   return byHour;

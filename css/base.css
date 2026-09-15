@@ -243,7 +243,6 @@ select { cursor: pointer; }
 .table-header-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .detail-bc { display: flex; align-items: center; gap: 7px; }
 .detail-bc[hidden] { display: none; }
-.detail-bc label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-2); font-weight: 600; }
 .detail-bc select {
   background: var(--bg-2); border: 1px solid var(--border-strong); color: var(--text-0);
   border-radius: var(--radius-md); padding: 6px 9px; font-size: 12px; font-family: var(--font-body); max-width: 220px;
@@ -670,6 +669,11 @@ tr.expanded + tr.row-detail .row-detail-inner { max-height: 640px; overflow-y: a
 .eng-url-readonly.missing { color: var(--loss); border-style: dashed; }
 .eng-note { font-size: 11.5px; color: var(--text-2); line-height: 1.5; margin: 0 0 12px; }
 .eng-hint { color: var(--text-2); font-weight: 400; text-transform: none; letter-spacing: 0; }
+.eng-kind-row { display: flex; align-items: center; justify-content: space-between; margin: 10px 0 4px; }
+.eng-kind-row:first-child { margin-top: 0; }
+#engCommentsSection.eng-kind-off,
+#engagementManualLikes.eng-kind-off,
+#engagementManualSaves.eng-kind-off { opacity: 0.4; pointer-events: none; }
 .modal textarea {
   width: 100%; margin-bottom: 12px; background: var(--bg-2); border: 1px solid var(--border);
   color: var(--text-0); padding: 8px 12px; border-radius: var(--radius-sm);
@@ -677,8 +681,10 @@ tr.expanded + tr.row-detail .row-detail-inner { max-height: 640px; overflow-y: a
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .modal textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.eng-placeholder { font-size: 12px; color: var(--text-1); line-height: 1.5; margin: 0 0 8px; min-height: 0; }
+.eng-placeholder { font-size: 12px; color: var(--text-1); line-height: 1.5; margin: 0 0 8px; min-height: 0; white-space: pre-line; }
 .eng-placeholder.ok { color: var(--profit); }
+.eng-placeholder.warn { color: var(--warn); }
+.eng-placeholder.bad { color: var(--loss); }
 .eng-placeholder.busy { color: var(--text-1); }
 .eng-placeholder:empty { display: none; }
 
@@ -959,9 +965,11 @@ tr.expanded + tr.row-detail .row-detail-inner { max-height: 640px; overflow-y: a
 .cc-tzblock-fields select { width: auto; min-width: 64px; }
 
 /* ============================== TRACKER ============================== */
-.tracker-modal { width: 1080px; max-width: 96vw; }
+/* Fixed-height modal (matches .wh-modal / .cc-modal) — the table area scrolls
+   internally instead of the whole dialog growing with the row count. */
+.tracker-modal { width: 1080px; max-width: 96vw; max-height: 88vh; display: flex; flex-direction: column; }
 
-.tracker-toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+.tracker-toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; flex: none; }
 
 .tracker-tabs, .tracker-offer-filter {
   display: flex; gap: 4px; background: var(--bg-1); border: 1px solid var(--border);
@@ -977,7 +985,7 @@ tr.expanded + tr.row-detail .row-detail-inner { max-height: 640px; overflow-y: a
 
 .tracker-add-winner-btn { margin-left: auto; }
 
-.tracker-table-wrap { overflow-x: auto; }
+.tracker-table-wrap { overflow-x: auto; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 .tracker-table { width: 100%; min-width: 900px; border-collapse: collapse; font-size: 12.5px; }
 .tracker-table th {
   text-align: left; font-weight: 600; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;

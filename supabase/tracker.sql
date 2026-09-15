@@ -22,6 +22,7 @@ create table if not exists tracker_tests (
   offer         text,                      -- 'CPI' | 'SWEEPS' — user-entered
   type          text not null default 'SLIDES', -- 'SLIDES' | 'VIDEOS' — auto (interactive card used?)
   hook          text,                      -- user-entered
+  spend         numeric not null default 0, -- that test day's TikTok spend; rows with 0 are never even inserted (see _shared/tracker.js) but the column stays for older rows / filtering
   cpa           numeric not null default 0,
   cpnc          numeric not null default 0,
   epc           numeric not null default 0,
@@ -32,6 +33,10 @@ create table if not exists tracker_tests (
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
 );
+
+-- Existing installs: the table already existed before the `spend` column was
+-- added, so `create table if not exists` above won't add it.
+alter table tracker_tests add column if not exists spend numeric not null default 0;
 
 create index if not exists tracker_tests_test_date_idx on tracker_tests (test_date);
 

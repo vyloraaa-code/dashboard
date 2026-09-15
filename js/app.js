@@ -18,6 +18,8 @@ import {
   deleteTiktokCampaign,
   setCampaignPostUrl,
   queueEngagementComments,
+  queueEngagementManual,
+  fetchEngagementDefaults,
   fetchEngagementOrders,
   listCommentTemplates,
   createCommentTemplate,
@@ -47,7 +49,7 @@ import {
   trackerDeleteWinner,
 } from "./api.js";
 import { initTheme } from "./theme.js";
-import { createMainChart } from "./charts.js";
+import { createMainChart, updateMainChart } from "./charts.js";
 
 // ---------------------------------------------------------------------------
 // Fallback dataset — only ever used on a brand-new browser with no cache AND
@@ -127,16 +129,17 @@ const state = {
   campaignMetricsDate: null, // NY date the metrics belong to
   campaignMetricsStale: false, // last metrics refresh had a partial/total failure
   spendToday: null, // { date, currentHour, cumulative, byHour } — Live Performance Spend series ONLY
+  earningsToday: null, // { date, currentHour, cumulative, byHour } — Live Performance Earnings series ONLY (combined Glitchy+Mabac)
   budgets: {}, // advertiser_id -> { budget_mode, capped, cap, spent, remaining, account_balance, currency, bc_id }
   bcBalances: {}, // bc_id -> { balance, currency, bc_name }
   detailBcFilter: "all", // "all" | bc_id — VIEW filter only, never untracks anything
   adGroupsByCampaign: {}, // campaign_id -> { loadedAt, rows, error }
   pendingActions: new Set(), // in-flight campaign/adgroup writes (double-click guard)
-  raw: [],
   hasFetchedOnce: false,
   prevConversions: new Map(),
   baseSpendTotal: 0,
   baseEarningsTotal: 0,
+  kpiPrevText: {}, // KPI element id -> its last-rendered text, so the flash-on-change animation only fires on an actual change
   expandedSources: new Set(),
   selectedCampaigns: new Set(), // campaign_ids checked in the Select column
   tracker: {
@@ -158,8 +161,11 @@ let mainChartCanvas = null;
 let openRowMenuFor = null; // campaignId whose ⋮ menu is open, or null
 let rowMenuEl = null; // the floating menu element (appended to <body>)
 let deleteCampaignTargets = []; // source row(s) pending delete confirmation
-let engagementTarget = null; // source row for the open engagement / comments modal
+let engagementManualTargets = []; // source row(s) for the open Engagement modal — 1 = single-campaign UI, >1 = batch
 const ENGAGEMENT_SERVICE_ID_KEY = "chigla_engagement_service_id_v1";
+// Which engagement kinds to actually send when "Add" is clicked — all on by
+// default; the modal's per-kind toggle switches flip these.
+const engagementToggles = { likes: true, saves: true, comments: true };
 
 // ============================== INIT ==============================
 
@@ -168,7 +174,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   initTheme(() => {
     // Chart colors are read from CSS vars at creation time — rebuild on theme swap.
-    renderChart();
+    renderChart(true);
   });
 
   mainChartCanvas = document.getElementById("mainChart");
@@ -221,17 +227,27 @@ async function loadTiktokCampaigns() {
   }
 }
 
-// Advertiser-account budgets + BC balances. Hits the MCP, so on load + manual
-// refresh only (not the 60s poll).
+// Advertiser-account budgets + BC balances. Hits the MCP — runs on load and
+// inside the 60s refresh cycle (like loadTiktokMetrics), not just a manual
+// refresh, so the Budget column stays current instead of needing a full page
+// reload. Guarded so a slow request never overlaps the next tick.
+let budgetsInFlight = false;
 async function loadTiktokBudgets() {
+  if (budgetsInFlight) return;
+  budgetsInFlight = true;
   try {
     const data = await fetchTiktokBudgets();
     state.budgets = data.advertisers || {};
     state.bcBalances = data.bc || {};
     renderDetailBcSelector();
     rebuildSources();
-  } catch (_) {
-    /* non-fatal — Budget column just shows — */
+  } catch (err) {
+    // Non-fatal — the Budget column just keeps its last-known values — but
+    // log it: this used to fail silently with no trace, which made a
+    // permanently-blank Budget column impossible to diagnose from the console.
+    console.error(`[budgets] refresh failed: ${err.message}`);
+  } finally {
+    budgetsInFlight = false;
   }
 }
 
@@ -339,10 +355,7 @@ function renderFromCacheOrFallback() {
     applyGlitchyResponse(cache.data, { flagNewConversions: false });
     lastUpdatedAt = cache.savedAt || Date.now();
   } else {
-    applyGlitchyResponse(
-      { sources: fallbackSources(), raw: [] },
-      { flagNewConversions: false }
-    );
+    applyGlitchyResponse({ sources: fallbackSources() }, { flagNewConversions: false });
     lastUpdatedAt = Date.now();
   }
 }
@@ -400,6 +413,7 @@ function wireEvents() {
   });
   document.getElementById("budgetModeSelect").addEventListener("change", syncBudgetAmountVisibility);
   document.getElementById("confirmBudgetBtn").addEventListener("click", submitBudgetEdit);
+  document.getElementById("setMinBudgetBtn").addEventListener("click", submitBudgetMinimum);
 
   // ---- ⋮ row menu: close on outside click / scroll / Escape ----
   document.addEventListener("click", (e) => {
@@ -428,13 +442,16 @@ function wireEvents() {
     if (e.target.id === "rejectionReasonModal") closeRejectionReasonModal();
   });
 
-  // ---- engagement: Add comments modal (foundation) ----
-  document.getElementById("closeEngagementCommentsModal").addEventListener("click", closeEngagementCommentsModal);
-  document.getElementById("cancelEngagementCommentsBtn").addEventListener("click", closeEngagementCommentsModal);
-  document.getElementById("engagementCommentsModal").addEventListener("click", (e) => {
-    if (e.target.id === "engagementCommentsModal") closeEngagementCommentsModal();
+  // ---- engagement modal (Likes / Saves / Comments, each toggleable) ----
+  document.getElementById("closeEngagementManualModal").addEventListener("click", closeEngagementManualModal);
+  document.getElementById("cancelEngagementManualBtn").addEventListener("click", closeEngagementManualModal);
+  document.getElementById("engagementManualModal").addEventListener("click", (e) => {
+    if (e.target.id === "engagementManualModal") closeEngagementManualModal();
   });
-  document.getElementById("submitEngagementCommentsBtn").addEventListener("click", submitEngagementComments);
+  document.getElementById("submitEngagementManualBtn").addEventListener("click", submitEngagementManual);
+  document.getElementById("engToggleLikes").addEventListener("click", () => toggleEngagementKind("likes"));
+  document.getElementById("engToggleSaves").addEventListener("click", () => toggleEngagementKind("saves"));
+  document.getElementById("engToggleComments").addEventListener("click", () => toggleEngagementKind("comments"));
   wireCommentTemplateEvents();
 
   document.getElementById("sourcesBody").addEventListener("click", (e) => {
@@ -558,6 +575,7 @@ async function refreshAll() {
       loadMabac(),
       loadTiktokMetrics(),
       loadTiktokCampaigns(),
+      loadTiktokBudgets(),
       runWhWarmupCleanup(),
       runCampaignCreatorDuplication(),
     ]);
@@ -595,7 +613,9 @@ function applyGlitchyResponse(data, { flagNewConversions }) {
   state.prevConversions = new Map(sources.map((s) => [s.source, s.conversions]));
 
   state.glitchyRows = sources;
-  state.raw = data.raw || [];
+  // Live Performance Earnings series only — keep the last snapshot if this
+  // cycle didn't return one (e.g. the snapshot table isn't migrated yet).
+  if (data.earningsToday) state.earningsToday = data.earningsToday;
 
   rebuildSources({ newConversionSources });
 }
@@ -731,12 +751,21 @@ function renderKpis() {
 function setKpi(id, text, sentiment) {
   const el = document.getElementById(id);
   if (!el) return;
+  // Only flash when the displayed value actually changed since the last
+  // render — this used to flash on EVERY ~60s refresh regardless (Net
+  // Profit's sentiment is always "positive" or "negative", never neither),
+  // which was a real, recurring "blink" at the top of the page even when
+  // nothing had changed. `undefined` (first render) never flashes either.
+  const prevText = state.kpiPrevText[id];
+  const changed = prevText !== undefined && prevText !== text;
+  state.kpiPrevText[id] = text;
+
   const flashClass = sentiment === "positive" ? "kpi-flash-up" : sentiment === "negative" ? "kpi-flash-down" : null;
   el.textContent = text;
   el.classList.remove("positive", "negative");
   if (sentiment) el.classList.add(sentiment);
   const card = el.closest(".kpi-card");
-  if (flashClass && card) {
+  if (changed && flashClass && card) {
     card.classList.remove("kpi-flash-up", "kpi-flash-down");
     void card.offsetWidth; // restart animation
     card.classList.add(flashClass);
@@ -748,7 +777,6 @@ function setKpi(id, text, sentiment) {
 function renderTable(newConversionSources) {
   const tbody = document.getElementById("sourcesBody");
   closeRowMenu(); // any re-render invalidates the floating menu's anchor
-  tbody.innerHTML = "";
 
   // Drop selections for campaigns that no longer exist in this render (e.g.
   // deleted, or filtered out by the BC view).
@@ -762,17 +790,37 @@ function renderTable(newConversionSources) {
   // (> 0) ROAS, so rows with no TikTok spend yet don't get an arbitrary crown.
   const bestRoas = sorted.reduce((best, s) => (s.roas > (best?.roas ?? 0) ? s : best), null);
 
+  // Reuse existing <tr> elements (keyed by source name) instead of tearing
+  // down and rebuilding the whole tbody on every refresh. Destroying every
+  // row on the ~60s auto-refresh was what actually caused the visible
+  // "blink" and the page nudging up/down: it restarted every row's CSS
+  // animation (the 3x+ ROAS glow) all at once, and reordering from live ROAS
+  // changes moved a freshly-recreated element instead of just relocating the
+  // one already there. Same content, same node — nothing for the browser to
+  // flash, and no layout thrash from wiping ~30+ rows at once.
+  const existingRows = new Map();
+  for (const child of tbody.children) {
+    if (child.classList.contains("source-row")) existingRows.set(child.dataset.source, child);
+  }
+
+  let anchor = null; // insert/keep each row+detail pair immediately after this node
   sorted.forEach((s) => {
-    const tr = document.createElement("tr");
+    let tr = existingRows.get(s.source);
+    let detailTr;
+    if (tr) {
+      existingRows.delete(s.source);
+      detailTr = tr.nextElementSibling;
+    } else {
+      tr = document.createElement("tr");
+      tr.dataset.source = s.source;
+      detailTr = document.createElement("tr");
+      detailTr.className = "row-detail";
+    }
+
     tr.className = "source-row " + (s.profit >= 0 ? "profit-positive" : "profit-negative");
     // Premium winner highlight: golden border at 2x+, add an animated glow at 3x+.
     if (s.roas >= 3) tr.classList.add("roas-gold", "roas-fire");
     else if (s.roas >= 2) tr.classList.add("roas-gold");
-    tr.dataset.source = s.source;
-    if (newConversionSources && newConversionSources.has(s.source)) {
-      tr.classList.add("new-conversion");
-      setTimeout(() => tr.classList.remove("new-conversion"), 2500);
-    }
 
     const crown = bestRoas && s === bestRoas ? `<span class="crown" title="Best ROAS today">👑</span>` : "";
 
@@ -791,18 +839,38 @@ function renderTable(newConversionSources) {
       <td class="num roas-cell" style="color:${roasColor(s.roas)}">${s.roas.toFixed(2)}x</td>
       <td class="budget-cell">${budgetCell(s)}</td>
     `;
-    tbody.appendChild(tr);
 
-    const detailTr = document.createElement("tr");
-    detailTr.className = "row-detail";
+    if (newConversionSources && newConversionSources.has(s.source)) {
+      // Force the glow to restart even if this row (rare, but possible across
+      // two conversions in quick succession) still had it from last time.
+      tr.classList.remove("new-conversion");
+      void tr.offsetWidth;
+      tr.classList.add("new-conversion");
+      setTimeout(() => tr.classList.remove("new-conversion"), 2500);
+    }
+
     detailTr.innerHTML = `<td colspan="13"><div class="row-detail-inner"><div class="adgroups-panel" data-adgroups-for="${escapeHtml(s.campaignId || "")}"></div></div></td>`;
-    tbody.appendChild(detailTr);
 
     if (state.expandedSources.has(s.source)) {
       tr.classList.add("expanded");
       requestAnimationFrame(() => renderAdGroupsPanel(s));
     }
+
+    // Position this pair right after `anchor` — a no-op (no DOM move at all)
+    // when it's already there, which is the common case on a routine refresh.
+    const afterAnchor = anchor ? anchor.nextElementSibling : tbody.firstElementChild;
+    if (afterAnchor !== tr) tbody.insertBefore(tr, afterAnchor);
+    if (tr.nextElementSibling !== detailTr) tbody.insertBefore(detailTr, tr.nextElementSibling);
+    anchor = detailTr;
   });
+
+  // Anything left is a source no longer in state.sources (deleted, or
+  // filtered out by the current Business Center view) — remove its pair.
+  for (const tr of existingRows.values()) {
+    const detailTr = tr.nextElementSibling;
+    tr.remove();
+    if (detailTr && detailTr.classList.contains("row-detail")) detailTr.remove();
+  }
 
   syncDetailActionsButton();
 }
@@ -905,23 +973,18 @@ function toggleDetailActionsMenu(btn) {
   openRowMenuFor = "bulk";
   btn.classList.add("active");
 
-  // Add comments opens ONE campaign's own modal (post URL, saved orders,
-  // template picker) — there's no single-campaign UI to generalize to many,
-  // so it stays a single-selection action; Edit budget and Delete both have
-  // well-defined bulk behavior and stay enabled for any selection size.
-  // (WH Warmup campaigns never reach this list at all — they're excluded
-  // from Detailed Metrics entirely — so there's no engagement exclusion to
-  // account for here anymore.)
-  const addCommentsItem =
-    selected.length === 1
-      ? `<button type="button" class="rowmenu-item" data-menu-action="add-comments">Add comments</button>`
-      : `<button type="button" class="rowmenu-item" disabled title="Select exactly one campaign to add comments">Add comments</button>`;
-
+  // Engagement runs the same call as a batch across every selected campaign's
+  // own tiktok_post_url (the modal handles the 1-vs-many UI difference
+  // itself) — same as Edit budget and Delete. Comments live inside the
+  // Engagement modal now (a toggleable kind alongside Likes/Saves), not as a
+  // separate menu entry. (WH Warmup campaigns never reach this list at all —
+  // they're excluded from Detailed Metrics entirely — so there's no
+  // engagement exclusion to account for here anymore.)
   const menu = document.createElement("div");
   menu.className = "rowmenu";
   menu.innerHTML = `
     <button type="button" class="rowmenu-item" data-menu-action="edit-budget">Edit budget${selected.length > 1 ? ` (${selected.length})` : ""}</button>
-    ${addCommentsItem}
+    <button type="button" class="rowmenu-item" data-menu-action="engagement">Engagement${selected.length > 1 ? ` (${selected.length})` : ""}</button>
     <button type="button" class="rowmenu-item danger" data-menu-action="delete-campaign">Delete campaign${selected.length > 1 ? `s (${selected.length})` : ""}</button>`;
   document.body.appendChild(menu);
   rowMenuEl = menu;
@@ -941,8 +1004,8 @@ function toggleDetailActionsMenu(btn) {
       const advIds = [...new Set(selected.map((s) => s.advertiserId).filter(Boolean))];
       if (advIds.length) openBudgetModal(advIds);
       else setStatus("No ad-account budget is available for the selected campaign(s).", true);
-    } else if (act === "add-comments") {
-      openEngagementCommentsModal(selected[0]);
+    } else if (act === "engagement") {
+      openEngagementManualModal(selected);
     } else if (act === "delete-campaign") {
       openDeleteCampaignModal(selected);
     }
@@ -1014,16 +1077,13 @@ async function confirmDeleteCampaign() {
   loadTiktokCampaigns();
 }
 
-// ---- engagement FOUNDATION: "Add comments" ----
-// No external artificial-engagement / SMM service is ever contacted. This modal
-// only stages a comment batch server-side (against the campaign's OWN stored
-// tiktok_post_url) for a future APPROVED provider integration. There is no
-// manual "attach URL" step — the URL comes from Campaign Creation Automation.
-
-function currentEngagementCampaign() {
-  if (!engagementTarget) return null;
-  return state.sources.find((x) => String(x.campaignId) === String(engagementTarget)) || null;
-}
+// ---- engagement: comments (a toggleable kind inside the Engagement modal) ----
+// Stages a comment batch server-side against each selected campaign's OWN
+// stored tiktok_post_url, and sends it to the configured comments provider
+// (DripFeedPanel) via the given Service ID — see _shared/engagement-provider.js.
+// One selected campaign shows the full single-campaign UI (editable URL, this
+// campaign's own auto-order history); more than one runs the same
+// template/service id as a batch against each campaign's own URL.
 
 // Global reusable comment templates (Supabase `comment_templates`). Never
 // touched by any cleanup. Selecting one loads its comments into the textarea;
@@ -1079,10 +1139,10 @@ function updateTemplateCommentCount() {
 }
 
 function showEcView(which) {
-  document.getElementById("ecMain").hidden = which !== "main";
+  document.getElementById("engManualMain").hidden = which !== "main";
   document.getElementById("ecTemplateForm").hidden = which !== "form";
-  document.getElementById("engagementCommentsTitle").textContent =
-    which === "form" ? (ecState.editId ? "Edit template" : "New template") : "Add comments";
+  document.getElementById("engagementManualTitle").textContent =
+    which === "form" ? (ecState.editId ? "Edit template" : "New template") : "Engagement";
 }
 
 async function loadCommentTemplates() {
@@ -1133,7 +1193,7 @@ function selectTemplate(id) {
   if (!t) return;
   ecState.selectedId = String(id);
   ecState.confirmDeleteId = null;
-  document.getElementById("engagementCommentsError").textContent = "";
+  document.getElementById("engagementManualError").textContent = "";
   renderTemplateList();
 }
 
@@ -1204,39 +1264,124 @@ async function confirmTemplateDelete(id) {
   renderTemplateList();
 }
 
-// The TikTok Post URL is prefilled from the campaign's stored tiktok_post_url
-// (Campaign Creation Automation will usually have set it), but stays editable.
-// Editing it here saves back to the campaign's tiktok_post_url before staging.
-// Exactly one saved template must be selected — there is no manual comments box.
-function openEngagementCommentsModal(s) {
-  if (!s || !s.campaignId) return;
-  engagementTarget = String(s.campaignId);
+const DEFAULT_SERVICE_ID = "5824";
+function loadServiceId() {
+  try {
+    return localStorage.getItem(ENGAGEMENT_SERVICE_ID_KEY) || DEFAULT_SERVICE_ID;
+  } catch (_) {
+    return DEFAULT_SERVICE_ID;
+  }
+}
+function saveServiceId(v) {
+  try {
+    if (v) localStorage.setItem(ENGAGEMENT_SERVICE_ID_KEY, v);
+  } catch (_) {}
+}
+
+// ---- Engagement modal: Likes / Saves / Comments, each independently
+// toggleable (on by default) ----
+// Fires the same panels the ~60s auto-trigger uses (see
+// _shared/engagement-provider.js) on demand, for campaigns it missed or
+// hasn't reached yet, or to explicitly re-send one kind. Likes/Saves defaults
+// pre-fill from the provider's own configured quantity so "Add" with no
+// edits matches what auto-engagement would place; Comments keeps its
+// existing template picker exactly as it worked as a standalone modal.
+let engagementManualDefaults = null; // cached { likes: {quantity,configured}, saves: {...} } for this session
+
+function syncEngagementToggleUI() {
+  const ids = { likes: "engToggleLikes", saves: "engToggleSaves", comments: "engToggleComments" };
+  for (const [kind, id] of Object.entries(ids)) {
+    const btn = document.getElementById(id);
+    const on = engagementToggles[kind];
+    btn.classList.toggle("on", on);
+    btn.setAttribute("aria-checked", on ? "true" : "false");
+  }
+  document.getElementById("engagementManualLikes").classList.toggle("eng-kind-off", !engagementToggles.likes);
+  document.getElementById("engagementManualSaves").classList.toggle("eng-kind-off", !engagementToggles.saves);
+  document.getElementById("engCommentsSection").classList.toggle("eng-kind-off", !engagementToggles.comments);
+}
+function toggleEngagementKind(kind) {
+  engagementToggles[kind] = !engagementToggles[kind];
+  syncEngagementToggleUI();
+}
+
+// One campaign: the TikTok Post URL is prefilled from the campaign's stored
+// tiktok_post_url (Campaign Creation Automation will usually have set it) but
+// stays editable — editing it here saves back to tiktok_post_url before
+// staging (required only when Comments is on; Likes/Saves-only fall back to
+// each campaign's already-stored URL, same as before this modal merged
+// comments in). Many campaigns: the URL field is hidden (each uses its own
+// stored URL; any missing one is called out and skipped) and the same
+// template/Service ID is queued against every one of them in a single batch.
+function openEngagementManualModal(sources) {
+  const list = (Array.isArray(sources) ? sources : [sources]).filter((s) => s && s.campaignId);
+  if (!list.length) return;
+  engagementManualTargets = list;
+  const single = list.length === 1;
+
+  engagementToggles.likes = true;
+  engagementToggles.saves = true;
+  engagementToggles.comments = true;
+  syncEngagementToggleUI();
 
   ecState.selectedId = null;
   ecState.confirmDeleteId = null;
   ecState.editId = null;
   showEcView("main");
 
-  document.getElementById("engagementCommentsCampaignName").textContent = s.source;
-  document.getElementById("engagementCommentsUrl").value = s.tiktokPostUrl || "";
+  document.getElementById("engagementManualCampaignName").textContent = single ? list[0].source : `${list.length} campaigns selected`;
+  document.getElementById("ecUrlField").hidden = !single;
+  document.getElementById("engagementCommentsUrl").value = single ? list[0].tiktokPostUrl || "" : "";
   document.getElementById("engagementServiceIdInput").value = loadServiceId();
-  const resultEl = document.getElementById("engagementCommentsResult");
-  resultEl.textContent = "";
-  resultEl.className = "eng-placeholder";
-  document.getElementById("engagementCommentsError").textContent = "";
+  document.getElementById("engagementManualError").textContent = "";
 
-  const btn = document.getElementById("submitEngagementCommentsBtn");
+  const resultEl = document.getElementById("engagementManualResult");
+  resultEl.className = "eng-placeholder";
+  const missing = list.filter((s) => !String(s.tiktokPostUrl || "").trim());
+  if (!single && missing.length) {
+    resultEl.className = "eng-placeholder warn";
+    resultEl.textContent = `${missing.length} of ${list.length} selected campaign(s) have no TikTok post URL yet and will be skipped: ${missing.map((s) => s.source).join(", ")}`;
+  } else {
+    resultEl.textContent = "";
+  }
+
+  const btn = document.getElementById("submitEngagementManualBtn");
   btn.disabled = false;
-  btn.textContent = "Add comments";
-  document.getElementById("engagementCommentsModal").classList.add("open");
+  btn.textContent = "Add";
+
+  const likesInput = document.getElementById("engagementManualLikes");
+  const savesInput = document.getElementById("engagementManualSaves");
+  const fillDefaults = (d) => {
+    likesInput.value = d?.likes?.quantity || "";
+    savesInput.value = d?.saves?.quantity || "";
+  };
+  if (engagementManualDefaults) {
+    fillDefaults(engagementManualDefaults);
+  } else {
+    likesInput.value = "";
+    savesInput.value = "";
+    fetchEngagementDefaults()
+      .then((d) => {
+        engagementManualDefaults = d;
+        if (document.getElementById("engagementManualModal").classList.contains("open")) fillDefaults(d);
+      })
+      .catch(() => {});
+  }
+
+  document.getElementById("engagementManualModal").classList.add("open");
 
   document.getElementById("ecTplList").innerHTML = `<div class="ec-tpl-empty">Loading templates…</div>`;
   loadCommentTemplates();
-  loadEngagementOrders(String(s.campaignId));
+  const autoEl = document.getElementById("ecAutoOrders");
+  autoEl.hidden = true;
+  autoEl.innerHTML = "";
+  if (single) loadEngagementOrders(String(list[0].campaignId));
 }
 
 // Shows what the Active-trigger auto-placed for this campaign (likes / saves)
-// and any prior comment batch. Read-only.
+// and any prior comment batch — including the provider's own failure reason
+// (`note`), so a stuck/failed order is diagnosable right here instead of
+// needing a database lookup. Read-only. Single-campaign view only.
 async function loadEngagementOrders(campaignId) {
   const el = document.getElementById("ecAutoOrders");
   if (!el) return;
@@ -1249,7 +1394,7 @@ async function loadEngagementOrders(campaignId) {
   } catch (_) {
     return;
   }
-  if (engagementTarget !== String(campaignId)) return; // modal moved on
+  if (engagementManualTargets.length !== 1 || String(engagementManualTargets[0].campaignId) !== String(campaignId)) return; // modal moved on
   if (!orders.length) return;
 
   const latest = {};
@@ -1267,85 +1412,159 @@ async function loadEngagementOrders(campaignId) {
       const qty = o.quantity ? `${o.quantity} ` : "";
       const ref = o.provider_ref ? ` · #${escapeHtml(String(o.provider_ref))}` : "";
       const label = o.status === "SUBMITTED" ? "ordered" : (o.status || "").toLowerCase();
-      return `<div class="ec-auto-row ${tone(o.status)}">${qty}${k.toLowerCase()} — ${escapeHtml(label)}${ref}</div>`;
+      const failNote = String(o.status || "").toUpperCase() === "FAILED" && o.note ? ` — ${escapeHtml(o.note)}` : "";
+      return `<div class="ec-auto-row ${tone(o.status)}">${qty}${k.toLowerCase()} — ${escapeHtml(label)}${ref}${failNote}</div>`;
     })
     .join("");
   el.innerHTML = rows;
   el.hidden = !rows;
 }
 
-function closeEngagementCommentsModal() {
-  document.getElementById("engagementCommentsModal").classList.remove("open");
-  engagementTarget = null;
+function closeEngagementManualModal() {
+  document.getElementById("engagementManualModal").classList.remove("open");
+  engagementManualTargets = [];
   showEcView("main"); // never leave the modal parked on the template form
 }
 
-const DEFAULT_SERVICE_ID = "5824";
-function loadServiceId() {
-  try {
-    return localStorage.getItem(ENGAGEMENT_SERVICE_ID_KEY) || DEFAULT_SERVICE_ID;
-  } catch (_) {
-    return DEFAULT_SERVICE_ID;
+// Combines queue_engagement_manual (Likes/Saves) and queue_engagement_comments
+// results — whichever kinds were actually toggled on — into one result box
+// per campaign. A campaign counts as failed if ANY kind it was sent for
+// failed. A single-campaign batch shows that one campaign's combined message;
+// a multi-campaign batch shows a success count plus which campaigns failed
+// and why, by name, so a partial failure is never silently swallowed.
+function renderCombinedEngagementResult(resultEl, targets, { manualResults, commentsResults }) {
+  resultEl.textContent = "";
+  resultEl.className = "eng-placeholder";
+  const manualById = new Map((manualResults || []).map((r) => [String(r.campaign_id), r]));
+  const commentsById = new Map((commentsResults || []).map((r) => [String(r.campaign_id), r]));
+  const ids = [...new Set([...manualById.keys(), ...commentsById.keys()])];
+  if (!ids.length) return;
+
+  const summarize = (cid) => {
+    const parts = [];
+    const mr = manualById.get(cid);
+    if (mr) {
+      const sub = [mr.likes, mr.saves].filter(Boolean).map((k) => k.message).filter(Boolean);
+      parts.push(...(sub.length ? sub : mr.ok ? [] : [mr.error || "likes/saves failed"]));
+    }
+    const cr = commentsById.get(cid);
+    if (cr) parts.push(cr.ok ? cr.message || "comments queued" : cr.error || "comments failed");
+    return parts.join(" · ") || "Done.";
+  };
+  const okFor = (cid) => {
+    const mr = manualById.get(cid);
+    const cr = commentsById.get(cid);
+    return (!mr || mr.ok) && (!cr || cr.ok);
+  };
+
+  if (ids.length === 1) {
+    const cid = ids[0];
+    resultEl.classList.add(okFor(cid) ? "ok" : "bad");
+    resultEl.textContent = summarize(cid);
+    return;
   }
-}
-function saveServiceId(v) {
-  try {
-    if (v) localStorage.setItem(ENGAGEMENT_SERVICE_ID_KEY, v);
-  } catch (_) {}
+  const byId = new Map(targets.map((s) => [String(s.campaignId), s]));
+  const okCount = ids.filter(okFor).length;
+  const lines = [`${okCount}/${ids.length} succeeded.`];
+  for (const cid of ids) {
+    if (!okFor(cid)) {
+      const name = byId.get(cid)?.source || cid;
+      lines.push(`✕ ${name}: ${summarize(cid)}`);
+    }
+  }
+  resultEl.classList.add(okCount === ids.length ? "ok" : okCount === 0 ? "bad" : "warn");
+  resultEl.textContent = lines.join("\n");
 }
 
-async function submitEngagementComments() {
-  const s = currentEngagementCampaign();
-  if (!s) return;
-  const errEl = document.getElementById("engagementCommentsError");
-  const resultEl = document.getElementById("engagementCommentsResult");
-  const btn = document.getElementById("submitEngagementCommentsBtn");
+async function submitEngagementManual() {
+  if (!engagementManualTargets.length) return;
+  const single = engagementManualTargets.length === 1;
+  const errEl = document.getElementById("engagementManualError");
+  const resultEl = document.getElementById("engagementManualResult");
+  const btn = document.getElementById("submitEngagementManualBtn");
   errEl.textContent = "";
   resultEl.textContent = "";
   resultEl.className = "eng-placeholder";
 
-  const url = document.getElementById("engagementCommentsUrl").value.trim();
-  if (!url) {
-    errEl.textContent = "Enter the TikTok post URL for this campaign.";
-    return;
+  const likes = engagementToggles.likes
+    ? Math.max(0, Math.floor(Number(document.getElementById("engagementManualLikes").value) || 0))
+    : 0;
+  const saves = engagementToggles.saves
+    ? Math.max(0, Math.floor(Number(document.getElementById("engagementManualSaves").value) || 0))
+    : 0;
+
+  let serviceId = "";
+  let commentBody = [];
+  if (engagementToggles.comments) {
+    serviceId = document.getElementById("engagementServiceIdInput").value.trim();
+    if (!serviceId) {
+      errEl.textContent = "Enter a Service ID (or turn Comments off).";
+      return;
+    }
+    if (!ecState.selectedId) {
+      errEl.textContent = "Select a comment template (or turn Comments off).";
+      return;
+    }
+    commentBody = selectedTemplateComments();
+    if (!commentBody.length) {
+      errEl.textContent = "That template has no comments — edit it first.";
+      return;
+    }
   }
-  const serviceId = document.getElementById("engagementServiceIdInput").value.trim();
-  if (!serviceId) {
-    errEl.textContent = "Enter a Service ID.";
-    return;
-  }
-  if (!ecState.selectedId) {
-    errEl.textContent = "Select a comment template.";
-    return;
-  }
-  const lines = selectedTemplateComments();
-  if (!lines.length) {
-    errEl.textContent = "That template has no comments — edit it first.";
+
+  if (!likes && !saves && !engagementToggles.comments) {
+    errEl.textContent = "Turn on at least one of Likes, Saves, or Comments.";
     return;
   }
 
-  saveServiceId(serviceId);
+  let targets = engagementManualTargets;
+  if (single) {
+    const url = document.getElementById("engagementCommentsUrl").value.trim();
+    if (engagementToggles.comments && !url) {
+      errEl.textContent = "Enter the TikTok post URL for this campaign.";
+      return;
+    }
+    const s = engagementManualTargets[0];
+    if (url && url !== (s.tiktokPostUrl || "")) {
+      // If the URL was edited (or the campaign had none), persist it to the
+      // campaign's tiktok_post_url first so the rest of the app stays in sync.
+      try {
+        const r = await setCampaignPostUrl(s.campaignId, url);
+        const tk = state.tiktokCampaigns.find((c) => String(c.campaign_id) === String(s.campaignId));
+        if (tk) tk.tiktok_post_url = r.tiktok_post_url ?? url;
+        rebuildSources();
+        s.tiktokPostUrl = url;
+      } catch (err) {
+        errEl.textContent = err.message;
+        return;
+      }
+    }
+  } else {
+    targets = engagementManualTargets.filter((s) => String(s.tiktokPostUrl || "").trim());
+    if (!targets.length) {
+      errEl.textContent = "None of the selected campaigns have a TikTok post URL yet.";
+      return;
+    }
+  }
+
+  if (engagementToggles.comments) saveServiceId(serviceId);
   btn.disabled = true;
   btn.textContent = "Adding…";
   try {
-    // If the URL was edited (or the campaign had none), persist it to the
-    // campaign's tiktok_post_url first so the rest of the app stays in sync.
-    if (url !== (s.tiktokPostUrl || "")) {
-      const r = await setCampaignPostUrl(s.campaignId, url);
-      const tk = state.tiktokCampaigns.find((c) => String(c.campaign_id) === String(s.campaignId));
-      if (tk) tk.tiktok_post_url = r.tiktok_post_url ?? url;
-      rebuildSources();
-    }
-    const res = await queueEngagementComments(s.campaignId, serviceId, lines);
-    resultEl.classList.add("ok");
-    resultEl.textContent =
-      res.message ||
-      `${res.count || lines.length} comment(s) staged for campaign “${s.source}”. Ready for an approved provider integration — nothing was sent.`;
+    const ids = targets.map((s) => s.campaignId);
+    const [manualRes, commentsRes] = await Promise.all([
+      likes || saves ? queueEngagementManual(ids, likes, saves) : Promise.resolve(null),
+      engagementToggles.comments ? queueEngagementComments(ids, serviceId, commentBody) : Promise.resolve(null),
+    ]);
+    renderCombinedEngagementResult(resultEl, targets, {
+      manualResults: manualRes ? manualRes.results : null,
+      commentsResults: commentsRes ? commentsRes.results : null,
+    });
     btn.textContent = "Done";
   } catch (err) {
     errEl.textContent = err.message;
     btn.disabled = false;
-    btn.textContent = "Add comments";
+    btn.textContent = "Add";
   }
 }
 
@@ -1396,6 +1615,7 @@ function wireWhWarmupEvents() {
     whState.connectionId = e.target.value;
     whState.selected.clear();
     renderWhAdvertisers();
+    refreshWhWarmingCount(); // the "WHs Warming Up" badge is scoped to this BC too
   });
   document.getElementById("whSelectAll").addEventListener("change", (e) => {
     const approved = whAdvsForConnection().filter((a) => advIsApproved(a));
@@ -1722,6 +1942,16 @@ function updateWhNextButton() {
   document.getElementById("whNextBtn").disabled = whState.selected.size === 0;
 }
 
+// One request creates warmup campaigns sequentially server-side (campaign ->
+// ad group -> Spark ad, PLUS the $5 account safety cap first — slightly more
+// MCP calls per account than Campaign Creator's own create) and the
+// serverless function has a hard wall-clock limit, so — exactly like
+// Campaign Creator (see CC_CREATE_CHUNK_SIZE) — a batch bigger than this is
+// split into consecutive requests of this size instead of one unbounded
+// request. The total batch size has no cap; a bigger batch just takes
+// proportionally longer (more requests).
+const WH_CREATE_CHUNK_SIZE = 6;
+
 async function submitWhWarmup() {
   const typed = document.getElementById("whCountryInput").value.trim();
   const spark = document.getElementById("whSparkInput").value.trim();
@@ -1741,20 +1971,59 @@ async function submitWhWarmup() {
     .filter((a) => whState.selected.has(String(a.advertiser_id)))
     .map((a) => String(a.advertiser_id));
   if (!ids.length) return whGoToStep(1);
+  // Computed once, up front, over the FULL list — so numbering stays
+  // continuous (wh1, wh2, …) across chunk boundaries instead of each chunk
+  // restarting at wh1 and colliding with an earlier one's names.
+  const namesAll = ids.map((_, i) => `wh${i + 1}`);
+  const total = ids.length;
+  const chunkCount = Math.ceil(total / WH_CREATE_CHUNK_SIZE);
 
   btn.disabled = true;
   btn.textContent = "Creating…";
   progressEl.className = "eng-placeholder busy";
-  progressEl.textContent = `Creating ${ids.length} warmup campaign${ids.length === 1 ? "" : "s"}… this can take a minute.`;
 
+  const allResults = [];
+  let warning = null;
   try {
-    const res = await createWhWarmup(whState.connectionId, ids, picked.name, spark, picked.location_id);
-    renderWhResults(res.results || [], res.warning);
+    for (let c = 0; c < chunkCount; c++) {
+      const start = c * WH_CREATE_CHUNK_SIZE;
+      const end = Math.min(start + WH_CREATE_CHUNK_SIZE, total);
+      progressEl.textContent = chunkCount > 1
+        ? `Creating ${total} warmup campaigns… batch ${c + 1}/${chunkCount} (${allResults.filter((x) => x.status === "Created").length} done so far).`
+        : `Creating ${total} warmup campaign${total === 1 ? "" : "s"}… this can take a minute.`;
+      try {
+        const res = await createWhWarmup(
+          whState.connectionId,
+          ids.slice(start, end),
+          picked.name,
+          spark,
+          picked.location_id,
+          namesAll.slice(start, end)
+        );
+        allResults.push(...(res.results || []));
+        if (res.warning && !warning) warning = res.warning;
+      } catch (chunkErr) {
+        // One batch failing outright (network error, etc.) never stops the
+        // rest — the remaining batches still run, this one's accounts are
+        // just recorded as failed.
+        ids.slice(start, end).forEach((advId, i) => {
+          const a = whAdvsForConnection().find((x) => String(x.advertiser_id) === advId);
+          allResults.push({
+            advertiser_id: advId,
+            advertiser_name: a?.advertiser_name || advId,
+            status: "Failed",
+            error: chunkErr.message,
+          });
+        });
+      }
+    }
+    renderWhResults(allResults, warning);
     whGoToStep(3);
     // Kick a cleanup pass so newly-Active ones start deleting promptly.
     runWhWarmupCleanup();
   } catch (err) {
     errEl.textContent = err.message;
+  } finally {
     btn.disabled = false;
     btn.textContent = "Create WH Warmup";
     progressEl.textContent = "";
@@ -1840,11 +2109,14 @@ function closeWhWarmingUpModal() {
   document.getElementById("whWarmingUpModal").classList.remove("open");
 }
 
+// Scoped to whState.connectionId — the box/modal live right under the BC
+// selector in the WH Warmup creator, so they only ever show/count that same
+// BC's warming campaigns, never every connected BC mixed together.
 async function loadWhWarmingList() {
   const el = document.getElementById("whWarmingList");
   el.innerHTML = `<p class="tk-loading">Loading WH campaigns…</p>`;
   try {
-    const res = await listWhWarmup();
+    const res = await listWhWarmup(whState.connectionId);
     whWarmingState.campaigns = res.campaigns || [];
     renderWhWarmingList();
     updateWhWarmingCount();
@@ -1857,7 +2129,7 @@ async function loadWhWarmingList() {
 // never blocks it.
 async function refreshWhWarmingCount() {
   try {
-    const res = await listWhWarmup();
+    const res = await listWhWarmup(whState.connectionId);
     whWarmingState.campaigns = res.campaigns || [];
     updateWhWarmingCount();
   } catch (_) {
@@ -3797,6 +4069,59 @@ async function submitBudgetEdit() {
   );
 }
 
+// "Set minimum budget" — sets each selected account's cap to whatever
+// minimum TikTok itself allows above its current spend. Bypasses the Cap
+// type / amount fields entirely: TikTok computes and applies the exact
+// number server-side (advertiser_update's ONE_CLICK_SET), since the actual
+// minimum varies account to account (TikTok's own ~105%-of-spend rule,
+// rounded however TikTok rounds it) and is never guessed here. Fired in
+// parallel across accounts — each is its own independent request to the
+// backend, not N MCP calls sharing one function's time budget, so there's no
+// reason to wait on them one at a time.
+async function submitBudgetMinimum() {
+  if (!budgetModalAdvIds.length) return;
+  const ids = budgetModalAdvIds;
+  const errEl = document.getElementById("budgetModalError");
+  errEl.textContent = "";
+
+  const btn = document.getElementById("setMinBudgetBtn");
+  const updateBtn = document.getElementById("confirmBudgetBtn");
+  btn.disabled = true;
+  updateBtn.disabled = true;
+  btn.textContent = ids.length > 1 ? `Setting ${ids.length}…` : "Setting…";
+  ids.forEach((id) => state.pendingActions.add(`b:${id}`));
+  rebuildSources();
+
+  const failures = await Promise.all(
+    ids.map(async (advId) => {
+      try {
+        const res = await setAdvertiserBudget(advId, "ONE_CLICK_MINIMUM", 0);
+        if (res.budget) state.budgets[advId] = { ...state.budgets[advId], ...res.budget };
+        return null;
+      } catch (err) {
+        return `${advId}: ${err.message}`;
+      } finally {
+        state.pendingActions.delete(`b:${advId}`);
+      }
+    })
+  );
+  const failed = failures.filter(Boolean);
+
+  btn.disabled = false;
+  updateBtn.disabled = false;
+  btn.textContent = "Set minimum budget";
+  rebuildSources();
+
+  if (failed.length) {
+    errEl.textContent = `${failed.length} account${failed.length === 1 ? "" : "s"} failed — ${failed.join("; ")}`;
+    return;
+  }
+  closeBudgetModal();
+  setStatus(
+    `${ids.length > 1 ? `${ids.length} ad account caps` : "Ad account cap"} set to TikTok's minimum above current spend.`
+  );
+}
+
 // Effective operating status for a SOURCE/campaign row. `status` is
 // { label, tone, detail } from the TikTok campaign, or null when the source
 // only exists on the Glitchy side (no matching tracked TikTok campaign).
@@ -3821,21 +4146,13 @@ function cssEscapeAttr(str) {
 
 // ============================== MAIN CHART ==============================
 
-function hourlyPayoutCombined() {
-  const buckets = Array(24).fill(0);
-  for (const entry of state.raw) {
-    const stat = entry.Stat || entry.stat || entry;
-    if (!stat) continue;
-    const hr = parseInt(stat.hour, 10);
-    if (Number.isFinite(hr) && hr >= 0 && hr < 24) buckets[hr] += Number(stat.payout || 0);
-  }
-  return buckets;
-}
-
-// Hourly TikTok spend for the Live Performance graph, derived from the
-// cumulative-spend snapshots the metrics refresh stores each NY hour.
+// Hourly series for the Live Performance graph, derived from a cumulative-
+// so-far snapshot object { date, currentHour, cumulative, byHour } — shared
+// by both Spend (TikTok) and Earnings (combined Glitchy+Mabac), which are
+// snapshotted the exact same way (see tiktok-campaigns.js's spendToday /
+// _shared/glitchy-daily.js's earningsSnapshotToday).
 //
-// Cumulative spend only ever goes up, so an hour with no recorded snapshot
+// A cumulative total only ever goes up, so an hour with no recorded snapshot
 // safely means "still whatever it last was" — never a real unknown. Forward-
 // filling the cumulative total across every hour (starting from 0 at
 // midnight) turns that into a smooth, always-connected line running from
@@ -3843,11 +4160,12 @@ function hourlyPayoutCombined() {
 // happened not to land (e.g. before the first poll of the day, or across any
 // stretch the dashboard was closed). Each hour's bar is then just the delta
 // between its filled-in cumulative total and the previous hour's — still
-// clamped at 0 so a counter reset never shows as a negative dip.
-// Future hours stay null. Aggregate only — the chart always shows the
-// combined total across every source.
-function hourlySpendSeries() {
-  const st = state.spendToday;
+// clamped at 0 so a counter reset never shows as a negative dip. The CURRENT
+// hour always uses the live cumulative value straight from this poll (not
+// whatever was last snapshotted), so the point for the hour in progress rises
+// immediately as new data comes in rather than waiting for the hour to end.
+// Future hours stay null.
+function hourlySeriesFromCumulative(st) {
   if (!st || st.date !== todayStr()) return Array(24).fill(null);
 
   const byHour = st.byHour || {};
@@ -3872,8 +4190,19 @@ function hourlySpendSeries() {
   }
   return out;
 }
+function hourlySpendSeries() {
+  return hourlySeriesFromCumulative(state.spendToday);
+}
+function hourlyEarningsSeries() {
+  return hourlySeriesFromCumulative(state.earningsToday);
+}
 
-function renderChart() {
+// `forceRecreate` is only for an actual theme swap (chart colors are read
+// from CSS vars at creation time). Every routine data refresh instead
+// updates the existing chart in place — destroying and recreating it every
+// ~60s replayed Chart.js's whole entrance animation, a visible flash right
+// near the top of the page on every single auto-refresh.
+function renderChart(forceRecreate) {
   if (!mainChartCanvas || !window.Chart) return;
 
   // Fixed 00:00–23:00 EST axis, always — never the viewer's local timezone.
@@ -3883,12 +4212,14 @@ function renderChart() {
   const limit = currentEstHour() + 1;
 
   const spendFull = hourlySpendSeries();
-  const earningsFull = hourlyPayoutCombined();
+  const earningsFull = hourlyEarningsSeries();
 
   const spendBuckets = spendFull.map((v, h) => (h < limit ? v : null));
   const earningsBuckets = earningsFull.map((v, h) => (h < limit ? v : null));
 
-  createMainChart(mainChartCanvas, hourLabels, earningsBuckets, spendBuckets);
+  if (forceRecreate || !updateMainChart(hourLabels, earningsBuckets, spendBuckets)) {
+    createMainChart(mainChartCanvas, hourLabels, earningsBuckets, spendBuckets);
+  }
 }
 
 // ============================== TOOLS DRAWER ==============================
@@ -4079,8 +4410,9 @@ function renderSelectedConnection() {
   // never steals its focus/cursor.
   const query = document.getElementById("tiktokAdvSearch")?.value || "";
   const shownAdvs = filterAdvsByQuery(advs, query);
+  const campMap = campaignNameByAdvertiser();
   const rows = shownAdvs.length
-    ? shownAdvs.map((a) => tiktokAdvRow(a)).join("")
+    ? shownAdvs.map((a) => tiktokAdvRow(a, campMap)).join("")
     : `<p class="tk-empty">${advs.length ? "No accounts match your search." : "No advertiser accounts found for this connection."}</p>`;
 
   const net = String(c.affiliate_network || "GLITCHY").toUpperCase();
@@ -4110,16 +4442,17 @@ function renderSelectedConnection() {
 // Informational row only — no selection control. Detailed Metrics scopes
 // itself automatically (tracked OR has a Campaign Creator campaign; see
 // scopedAdvertisers in tiktok-campaigns.js), so there's nothing to pick here.
-function tiktokAdvRow(a) {
+function tiktokAdvRow(a, campMap) {
   const meta = [a.advertiser_id, a.currency || null, a.display_timezone || a.timezone || null]
     .filter(Boolean)
     .join(" · ");
   const approved = advIsApproved(a);
+  const campaignName = campMap ? campMap.get(String(a.advertiser_id)) : null;
   return `
     <div class="tk-adv">
       <span class="tk-adv-main">
         <span class="tk-adv-name">${escapeHtml(a.advertiser_name || a.advertiser_id)}</span>
-        <span class="tk-adv-meta">${escapeHtml(meta)}</span>
+        <span class="tk-adv-meta">${escapeHtml(meta)}${campaignName ? ` <span class="tk-adv-campaign">| ${escapeHtml(campaignName)}</span>` : ""}</span>
       </span>
       <span class="tk-adv-status ${approved ? "ok" : "warn"}">${advStatusLabel(a)}</span>
     </div>`;
@@ -4505,10 +4838,21 @@ async function loadTrackerData() {
   }
 }
 
+// Hide zero-spend placeholder rows (a campaign that never actually spent that
+// day). `spend` may be absent on rows recorded before supabase/tracker.sql's
+// spend column existed — for those, fall back to "every auto metric is 0",
+// the same signature a true $0 day has, so real historical winners with a
+// nonzero cpa/cpnc/epc/roas are never hidden just because `spend` is missing.
+function trackerTestHasSpend(r) {
+  if (r.spend != null) return Number(r.spend) > 0;
+  return toNum(r.cpa) > 0 || toNum(r.cpnc) > 0 || toNum(r.epc) > 0 || toNum(r.roas) > 0;
+}
+
 function trackerFilteredTests() {
   const f = state.tracker.offerFilter;
-  if (f === "all") return state.tracker.tests;
-  return state.tracker.tests.filter((r) => String(r.offer || "").toUpperCase() === f);
+  const base = state.tracker.tests.filter(trackerTestHasSpend);
+  if (f === "all") return base;
+  return base.filter((r) => String(r.offer || "").toUpperCase() === f);
 }
 
 function trackerFilteredWinners() {

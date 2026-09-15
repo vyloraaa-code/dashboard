@@ -16,7 +16,8 @@
 
 const { getSupabase, sbErr, checkPassword, json } = require("./_shared/tiktok-mcp");
 
-const TEST_COLS = "id, campaign_id, sn, offer, type, hook, cpa, cpnc, epc, roas, result, notes, test_date, created_at, updated_at";
+const TEST_COLS = "id, campaign_id, sn, offer, type, hook, spend, cpa, cpnc, epc, roas, result, notes, test_date, created_at, updated_at";
+const TEST_COLS_NO_SPEND = "id, campaign_id, sn, offer, type, hook, cpa, cpnc, epc, roas, result, notes, test_date, created_at, updated_at";
 const WINNER_COLS = "id, offer, type, hook, total_spend, total_revenue, notes, created_at, updated_at";
 
 const OFFERS = new Set(["CPI", "SWEEPS"]);
@@ -59,10 +60,19 @@ exports.handler = async function (event) {
     if (!pw.ok) return json(pw.code, { error: pw.error });
 
     if (body.action === "list") {
-      const [{ data: tests, error: tErr }, { data: winners, error: wErr }] = await Promise.all([
+      let [{ data: tests, error: tErr }, { data: winners, error: wErr }] = await Promise.all([
         supabase.from("tracker_tests").select(TEST_COLS).order("test_date", { ascending: false }).order("created_at", { ascending: false }),
         supabase.from("tracker_winners").select(WINNER_COLS).order("created_at", { ascending: true }),
       ]);
+      if (tErr && /spend/.test(tErr.message || "") && /does not exist|schema cache|could not find/i.test(tErr.message || "")) {
+        // `spend` not migrated yet (supabase/tracker.sql) — retry without it so
+        // the Tests list still loads; the frontend just can't filter $0 rows.
+        ({ data: tests, error: tErr } = await supabase
+          .from("tracker_tests")
+          .select(TEST_COLS_NO_SPEND)
+          .order("test_date", { ascending: false })
+          .order("created_at", { ascending: false }));
+      }
       if (tErr && !/does not exist|schema cache|could not find/i.test(tErr.message || "")) {
         return json(500, { error: "Supabase read failed", details: sbErr(tErr) });
       }

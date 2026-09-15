@@ -61,6 +61,7 @@ const {
   connectMcp,
   loadCampaignDetail,
   applyAppealOverlay,
+  markEngagementReadyIfActive,
   json,
 } = require("./_shared/tiktok-mcp");
 const { duplicateForRow, registerForDuplication, DUPES_PER_CYCLE } = require("./_shared/campaign-creator.js");
@@ -224,14 +225,47 @@ async function processDuplication(supabase) {
   // matching TikTok's real current state for the campaign's whole life, not
   // just during its initial review — it just never re-enters appeal/
   // duplication handling once it's past that stage.
-  const { data: rows, error } = await supabase.from("campaign_creator_campaigns").select("*");
+  //
+  // This table is never purged (it's the permanent duplication/appeal audit
+  // trail), so it only grows — with this account's volume (1 CBO per ad, 20
+  // ad-group dupes) it can hold a lot of history. The 45s deadline below can't
+  // always reach every row in one tick, so newest-first ordering matters: a
+  // freshly launched campaign's status is still actively changing (review ->
+  // active, appeal outcome, etc.) and needs to surface fast, while an old
+  // COMPLETE/FAILED row's status rarely changes again. Without this order, an
+  // unordered `select("*")` on a large table can leave the very rows a user
+  // just launched waiting behind years of settled history that didn't need
+  // rechecking this cycle at all.
+  const { data: fetched, error } = await supabase
+    .from("campaign_creator_campaigns")
+    .select("*")
+    .order("created_at", { ascending: false });
   if (error) {
     if (/does not exist|schema cache|could not find the table/i.test(error.message || "")) {
       return json(200, { ok: true, checked: 0, created: 0, completed: 0, failed: 0, unmigrated: true });
     }
     return json(500, { error: "Supabase read failed", details: sbErr(error) });
   }
-  if (!rows || !rows.length) return json(200, { ok: true, checked: 0, created: 0, completed: 0, failed: 0 });
+  if (!fetched || !fetched.length) return json(200, { ok: true, checked: 0, created: 0, completed: 0, failed: 0 });
+
+  // DUPLICATING rows routinely need several ticks each (DUPES_PER_CYCLE=5 vs.
+  // a dupe_target that can be 20+), and the 45s deadline below can cut a tick
+  // off partway through the list. Left in the newest-first order above, the
+  // SAME campaigns — whichever landed earliest in the list — would claim the
+  // budget on every single tick, while campaigns sorted later never got a
+  // turn at all: exactly the "some got all 10 dupes, some got 0" bug this
+  // fixes. Pulling DUPLICATING rows out and sorting them oldest-updated-first
+  // makes it self-correcting: a row touched this tick sorts to the back next
+  // time, so whichever rows were skipped naturally rise to the front instead
+  // of the same ones winning every tick. WAITING_FOR_ACTIVE/READY/FAILED/
+  // COMPLETE keep the original newest-first order untouched (see the comment
+  // above) — this only reorders the rows actually competing for the
+  // duplication budget.
+  const duplicating = fetched
+    .filter((r) => r.dupe_status === "DUPLICATING")
+    .sort((a, b) => new Date(a.updated_at || 0) - new Date(b.updated_at || 0));
+  const rest = fetched.filter((r) => r.dupe_status !== "DUPLICATING");
+  const rows = [...duplicating, ...rest];
 
   const byConnection = {};
   for (const r of rows) (byConnection[r.connection_id] = byConnection[r.connection_id] || []).push(r);
@@ -394,6 +428,15 @@ async function patchRow(supabase, campaignId, patch) {
 // loadCampaignDetail result. Best-effort — the "metrics" 60s tick doesn't
 // re-derive status, so this keeps a creator campaign's Detailed Metrics badge
 // current while it moves through review / appeal / Active.
+//
+// This is also the ONLY place that observes a Campaign Creator campaign
+// reaching "Active" on the automatic ~60s cycle — the full discovery `sync`
+// that normally flips engagement_status to READY (see
+// markEngagementReadyIfActive in _shared/tiktok-mcp.js) only runs on a manual
+// "Refresh Data" click, there is no server-side cron for it. So the auto
+// LIKES/SAVES trigger is wired in right here: the instant this tick sees a
+// campaign go Active, it's marked READY too — same idempotent flag the
+// pending-engagement worker below already treats as "add once, never again."
 async function persistTiktokCampaignStatus(supabase, campaignId, detail) {
   if (!detail || !detail.effective_status) return;
   try {
@@ -410,6 +453,9 @@ async function persistTiktokCampaignStatus(supabase, campaignId, detail) {
         updated_at: new Date().toISOString(),
       })
       .eq("campaign_id", String(campaignId));
+    if (detail.effective_status === "Active") {
+      await markEngagementReadyIfActive(supabase, [campaignId]);
+    }
   } catch (err) {
     console.error(`[campaign-creator] status persist ${campaignId} failed: ${err.message}`);
   }

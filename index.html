@@ -96,8 +96,7 @@
       <div class="section-title-row"><h2>Detailed Metrics</h2></div>
       <div class="table-header-right">
         <div class="detail-bc" id="detailBcWrap" hidden>
-          <label for="detailBcSelect">Business Center</label>
-          <select id="detailBcSelect"></select>
+          <select id="detailBcSelect" aria-label="Business Center"></select>
         </div>
         <div class="detail-bc-balance" id="detailBcBalance" hidden></div>
         <button class="icon-btn primary" id="openDupeModalBtn">Dupe</button>
@@ -236,6 +235,7 @@
     </div>
     <div class="modal-error" id="budgetModalError"></div>
     <div class="modal-actions">
+      <button class="icon-btn" id="setMinBudgetBtn" style="margin-right:auto;" title="Sets each selected account's cap to whatever minimum TikTok allows above its current spend">Set minimum budget</button>
       <button class="icon-btn" id="cancelBudgetBtn">Cancel</button>
       <button class="icon-btn primary" id="confirmBudgetBtn">Update</button>
     </div>
@@ -444,37 +444,58 @@
   </div>
 </div>
 
-<!-- ============ ENGAGEMENT: ADD COMMENTS MODAL ============ -->
-<div class="modal-backdrop" id="engagementCommentsModal">
+<!-- ============ ENGAGEMENT MODAL (Likes / Saves / Comments) ============ -->
+<div class="modal-backdrop" id="engagementManualModal">
   <div class="modal ec-modal">
     <div class="modal-header">
-      <h3 id="engagementCommentsTitle">Add comments</h3>
-      <button id="closeEngagementCommentsModal">✕</button>
+      <h3 id="engagementManualTitle">Engagement</h3>
+      <button id="closeEngagementManualModal">✕</button>
     </div>
 
     <!-- MAIN view -->
-    <div id="ecMain">
-      <p class="eng-target">Campaign: <strong id="engagementCommentsCampaignName"></strong></p>
+    <div id="engManualMain">
+      <p class="eng-target">Campaign: <strong id="engagementManualCampaignName"></strong></p>
+      <p class="eng-note">On-demand push to the same panels the auto-trigger uses — for campaigns it missed or hasn't reached yet. Turn off any kind you don't want sent for this link.</p>
 
       <div class="ec-auto" id="ecAutoOrders" hidden></div>
 
-      <label class="budget-field-label" for="engagementCommentsUrl">TikTok Post URL</label>
-      <input type="text" id="engagementCommentsUrl" placeholder="https://www.tiktok.com/@handle/video/…" autocomplete="off" />
-
-      <label class="budget-field-label" for="engagementServiceIdInput">Service ID</label>
-      <input type="text" id="engagementServiceIdInput" placeholder="e.g. 5824" autocomplete="off" />
-
-      <div class="ec-tpl-head">
-        <span class="budget-field-label" style="margin:0;">Templates <span class="eng-hint">(pick one)</span></span>
-        <button type="button" class="ec-tpl-add" id="ecTplAddBtn" title="New template">+</button>
+      <div id="ecUrlField">
+        <label class="budget-field-label" for="engagementCommentsUrl">TikTok Post URL</label>
+        <input type="text" id="engagementCommentsUrl" placeholder="https://www.tiktok.com/@handle/video/…" autocomplete="off" />
       </div>
-      <div class="ec-tpl-list" id="ecTplList"></div>
 
-      <div class="eng-placeholder" id="engagementCommentsResult"></div>
-      <div class="modal-error" id="engagementCommentsError"></div>
+      <div class="eng-kind-row">
+        <label class="budget-field-label" for="engagementManualLikes" style="margin:0;">Likes</label>
+        <button type="button" class="tk-switch on" id="engToggleLikes" role="switch" aria-checked="true" title="Send Likes"></button>
+      </div>
+      <input type="number" id="engagementManualLikes" min="0" step="1" placeholder="0" />
+
+      <div class="eng-kind-row">
+        <label class="budget-field-label" for="engagementManualSaves" style="margin:0;">Saves</label>
+        <button type="button" class="tk-switch on" id="engToggleSaves" role="switch" aria-checked="true" title="Send Saves"></button>
+      </div>
+      <input type="number" id="engagementManualSaves" min="0" step="1" placeholder="0" />
+
+      <div class="eng-kind-row">
+        <span class="budget-field-label" style="margin:0;">Comments</span>
+        <button type="button" class="tk-switch on" id="engToggleComments" role="switch" aria-checked="true" title="Send Comments"></button>
+      </div>
+      <div id="engCommentsSection">
+        <label class="budget-field-label" for="engagementServiceIdInput">Service ID</label>
+        <input type="text" id="engagementServiceIdInput" placeholder="e.g. 5824" autocomplete="off" />
+
+        <div class="ec-tpl-head">
+          <span class="budget-field-label" style="margin:0;">Templates <span class="eng-hint">(pick one)</span></span>
+          <button type="button" class="ec-tpl-add" id="ecTplAddBtn" title="New template">+</button>
+        </div>
+        <div class="ec-tpl-list" id="ecTplList"></div>
+      </div>
+
+      <div class="eng-placeholder" id="engagementManualResult"></div>
+      <div class="modal-error" id="engagementManualError"></div>
       <div class="modal-actions">
-        <button class="icon-btn" id="cancelEngagementCommentsBtn">Cancel</button>
-        <button class="icon-btn primary" id="submitEngagementCommentsBtn">Add comments</button>
+        <button class="icon-btn" id="cancelEngagementManualBtn">Cancel</button>
+        <button class="icon-btn primary" id="submitEngagementManualBtn">Add</button>
       </div>
     </div>
 

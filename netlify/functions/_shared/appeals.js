@@ -437,6 +437,21 @@ async function handleAutoAppeal({ supabase, client, row, advertiserStatus }) {
       log(`appeal rejected by TikTok (appeal_status=${appealStatus})`);
       return { blockDuplication: true, detail, appealState: currentState };
     }
+    // TikTok doesn't always leave an explicit "rejected" marker on
+    // appeal_status once a decision is made — it can just clear it back to
+    // "no active appeal" (e.g. "NOT_APPEALED"/"NO_APPEAL"/empty), which
+    // wouldn't match appealStatusRejected above. If there's no appeal in
+    // flight anymore per TikTok but the ad group (checked seconds ago, same
+    // detail this tick derived) is genuinely back to Rejected — not approved
+    // (that already returned above), not still in review — the appeal must
+    // have concluded against us. Without this, the row is stuck reporting
+    // "Appeal Under Review" at the campaign level forever even though the ad
+    // group itself has already flipped back to Rejected.
+    if (!appealStatusIsSomeAppeal(appealStatus) && label === "rejected") {
+      await persist({ appeal_state: "APPEAL_REJECTED" });
+      log(`appeal concluded rejected — ad group back to Rejected with no active appeal (appeal_status=${appealStatus || "empty"})`);
+      return { blockDuplication: true, detail, appealState: currentState };
+    }
     return { blockDuplication: true, detail, appealState: currentState }; // still pending
   }
 

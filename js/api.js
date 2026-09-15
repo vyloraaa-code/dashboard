@@ -255,17 +255,49 @@ export async function setCampaignPostUrl(campaignId, tiktokPostUrl) {
   return readTiktokResponse(res, "Couldn't save the post URL"); // { tiktok_post_url }
 }
 
-// Queue a comment batch (one per line) against the campaign's tiktok_post_url.
-// Server-side it is stored as an engagement_orders row and, if
-// ENGAGEMENT_COMMENTS_API_KEY is configured, sent to the comments provider
+// Queue the SAME comment batch (one per line) against one or many campaigns'
+// own tiktok_post_url — pass a single id or an array. Server-side each
+// campaign gets its own engagement_orders row and, if
+// ENGAGEMENT_COMMENTS_API_KEY is configured, is sent to the comments provider
 // (DripFeedPanel) with the given Service ID. No credentials are ever returned.
-export async function queueEngagementComments(campaignId, serviceId, comments) {
+// -> { results: [{ campaign_id, ok, message, ... }] }
+export async function queueEngagementComments(campaignIds, serviceId, comments) {
   const res = await fetch("/.netlify/functions/tiktok-campaigns", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "queue_engagement_comments", campaign_id: campaignId, service_id: serviceId, comments }),
+    body: JSON.stringify({ action: "queue_engagement_comments", campaign_ids: [].concat(campaignIds), service_id: serviceId, comments }),
   });
   return readTiktokResponse(res, "Couldn't queue the comments");
+}
+
+// On-demand LIKES/SAVES push for one or many campaigns — a fallback for
+// campaigns the ~60s auto-trigger missed or gave up on. Bypasses that
+// trigger's own state entirely; a 0/omitted quantity skips that kind.
+// -> { results: [{ campaign_id, ok, likes?, saves? }] }
+export async function queueEngagementManual(campaignIds, likesQuantity, savesQuantity) {
+  const res = await fetch("/.netlify/functions/tiktok-campaigns", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "queue_engagement_manual",
+      campaign_ids: [].concat(campaignIds),
+      likes_quantity: likesQuantity,
+      saves_quantity: savesQuantity,
+    }),
+  });
+  return readTiktokResponse(res, "Couldn't queue the engagement");
+}
+
+// Current LIKES/SAVES panel defaults — used to pre-fill the Engagement
+// modal with "default = whatever auto-engagement currently uses."
+// -> { likes: { quantity, configured }, saves: { quantity, configured } }
+export async function fetchEngagementDefaults() {
+  const res = await fetch("/.netlify/functions/tiktok-campaigns", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "engagement_defaults" }),
+  });
+  return readTiktokResponse(res, "Couldn't load engagement defaults");
 }
 
 // Read-only: the engagement orders (likes / saves / comments) recorded for one
@@ -462,7 +494,13 @@ export async function setConnectionNetwork(connectionId, affiliateNetwork) {
 // Bulk temporary Traffic-CBO warmup campaigns that auto-delete once Active.
 // All TikTok writes are server-side; nothing sensitive is returned here.
 
-export async function createWhWarmup(connectionId, advertiserIds, targetCountry, sparkCode, locationId) {
+// `campaignNames` (optional, same length/order as advertiserIds): the exact
+// "whN" name to use for each account. A large batch is sent as several
+// smaller requests (see js/app.js submitWhWarmup) so continuous numbering
+// across requests needs the caller to compute names once up front, the same
+// way Campaign Creator's own chunked create does — without this, each
+// request would restart naming from wh1 and collide with an earlier chunk's.
+export async function createWhWarmup(connectionId, advertiserIds, targetCountry, sparkCode, locationId, campaignNames) {
   const res = await fetch("/.netlify/functions/wh-warmup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -473,6 +511,7 @@ export async function createWhWarmup(connectionId, advertiserIds, targetCountry,
       target_country: targetCountry,
       location_id: locationId || null,
       spark_code: sparkCode,
+      ...(campaignNames ? { campaign_names: campaignNames } : {}),
     }),
   });
   return readTiktokResponse(res, "WH Warmup creation failed"); // { results: [...] }
@@ -513,11 +552,14 @@ export async function cleanupWhWarmup() {
   return readTiktokResponse(res, "WH Warmup cleanup failed");
 }
 
-export async function listWhWarmup() {
+// `connectionId` (optional): scopes the list to one Business Center — the
+// "WHs Warming Up" box sits right under the BC selector in the WH Warmup
+// creator, so it only shows that same BC's campaigns. Omit for every BC.
+export async function listWhWarmup(connectionId) {
   const res = await fetch("/.netlify/functions/wh-warmup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "list" }),
+    body: JSON.stringify({ action: "list", ...(connectionId ? { connection_id: connectionId } : {}) }),
   });
   return readTiktokResponse(res, "Couldn't load WH Warmup campaigns"); // { campaigns: [...] }
 }

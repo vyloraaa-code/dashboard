@@ -164,7 +164,17 @@ async function tiktokSpendForToday(supabase, today) {
     const { data, error } = await supabase
       .from("tiktok_campaigns")
       .select("campaign_id, today_spend, today_date");
-    if (error || !Array.isArray(data)) return 0;
+    if (error) {
+      // Was silent before — a real error here (as opposed to a genuinely
+      // empty table) previously meant the Live Performance Spend line sat at
+      // a permanent, indistinguishable-from-"no data" $0 with no trace of
+      // why anywhere. "does not exist"/"schema cache" means
+      // supabase/tiktok_campaign_metrics.sql hasn't been run yet; anything
+      // else is worth investigating.
+      console.error(`[tiktokSpendForToday] query failed: ${error.message}`);
+      return 0;
+    }
+    if (!Array.isArray(data)) return 0;
 
     // WH Warmup campaigns show in Detailed Metrics while they exist but their
     // throwaway warmup spend must never land in the permanent daily_totals
@@ -184,7 +194,8 @@ async function tiktokSpendForToday(supabase, today) {
       spend += Number(r.today_spend) || 0;
     }
     return Math.round(spend * 100) / 100;
-  } catch (_) {
+  } catch (err) {
+    console.error(`[tiktokSpendForToday] failed: ${err.message}`);
     return 0;
   }
 }
@@ -223,6 +234,60 @@ async function upsertTodayTotals(supabase, entries, opts = {}) {
   return { date: today, total_spend: totalSpend, total_earnings: earnings };
 }
 
+// Current hour (0-23) in America/New_York — same clock as todayEst().
+function nyHourNow() {
+  const s = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false }).format(new Date());
+  return parseInt(s, 10) % 24; // guards the historical "24" at midnight
+}
+
+// Snapshot mirrors tiktok_spend_snapshots.sql exactly, but for combined
+// Glitchy+Mabac earnings — see supabase/earnings_snapshots.sql. Never throws:
+// a write/read hiccup here must never blank out the Live Performance graph's
+// Earnings line, so each step is isolated in its own try/catch.
+async function recordEarningsSnapshot(supabase, date, hour, cumulative) {
+  const value = Math.round((Number(cumulative) || 0) * 100) / 100;
+  try {
+    const { error } = await supabase.from("earnings_snapshots").upsert(
+      { date, hour, cumulative_earnings: value, updated_at: new Date().toISOString() },
+      { onConflict: "date,hour" }
+    );
+    if (error) {
+      if (/earnings_snapshots|does not exist|schema cache/i.test(error.message || "")) return;
+      throw error;
+    }
+    // Opportunistic cleanup — tiny table, keep ~14 days.
+    const cutoff = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+    await supabase.from("earnings_snapshots").delete().lt("date", cutoff);
+  } catch (err) {
+    console.error(`[earnings-snapshot] write failed: ${err.message}`);
+  }
+}
+
+// { "<hour>": cumulative_earnings } for one NY date. Empty on any error / no rows.
+async function readEarningsSnapshots(supabase, date) {
+  try {
+    const { data, error } = await supabase.from("earnings_snapshots").select("hour, cumulative_earnings").eq("date", date);
+    if (error || !Array.isArray(data)) return {};
+    const byHour = {};
+    for (const r of data) byHour[String(r.hour)] = Number(r.cumulative_earnings) || 0;
+    return byHour;
+  } catch (_) {
+    return {};
+  }
+}
+
+// Records this poll's combined-earnings-so-far into the current NY hour and
+// hands back every hour's cumulative for the frontend to derive hourly
+// earnings from (delta between consecutive snapshots) — the Earnings-series
+// analog of tiktok-campaigns.js's spendToday. Always returns a real object;
+// never null (a snapshot hiccup just means byHour is incomplete this cycle).
+async function earningsSnapshotToday(supabase, date, earnings) {
+  const hour = nyHourNow();
+  await recordEarningsSnapshot(supabase, date, hour, earnings);
+  const byHour = await readEarningsSnapshots(supabase, date);
+  return { date, currentHour: hour, cumulative: earnings, byHour };
+}
+
 // campaign_name -> affiliate_network, from tiktok_campaigns. Empty on any error
 // (e.g. before the migration) so callers just get Glitchy-only behaviour.
 async function networkByCampaignName(supabase) {
@@ -249,4 +314,5 @@ module.exports = {
   networkByCampaignName,
   tiktokSpendForToday,
   upsertTodayTotals,
+  earningsSnapshotToday,
 };

@@ -115,12 +115,16 @@ export function createMainChart(canvas, hours, earnings, spend) {
   return mainChartInstance;
 }
 
+// Updates the existing chart's data in place (no destroy/recreate, so none
+// of Chart.js's entrance animation replays). Returns false when there's no
+// instance yet, so the caller knows to fall back to createMainChart.
 export function updateMainChart(hours, earnings, spend) {
-  if (!mainChartInstance) return;
+  if (!mainChartInstance) return false;
   mainChartInstance.data.labels = hours;
   mainChartInstance.data.datasets[0].data = earnings;
   mainChartInstance.data.datasets[1].data = spend;
   mainChartInstance.update();
+  return true;
 }
 
 const miniCharts = new Map();

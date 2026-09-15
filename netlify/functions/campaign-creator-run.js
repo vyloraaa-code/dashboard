@@ -501,6 +501,30 @@ async function createBatch(supabase, body) {
           tiktok_post_url: created.post_url,
         });
 
+        // Mark the advertiser tracked NOW, independent of whether the
+        // duplication-lifecycle registration just below succeeds. Every write
+        // action (pause/resume/delete/engagement/…) gates on
+        // resolveTrackedCampaign, which allows a campaign through only when
+        // its advertiser is tracked=true OR it has a campaign_creator_campaigns
+        // row. Before this, ONLY a successful registerForDuplication (or a
+        // later manual "Refresh Data" discovering it as a "stray") ever set
+        // that — so a campaign whose registration failed (a transient Supabase
+        // error; reported below as a warning, never blocking creation) stayed
+        // permanently invisible to every write action forever, despite showing
+        // up fine in Detailed Metrics (that read has no tracked gate at all).
+        // Same one-line fix stray-campaigns.js already uses for the same
+        // reason. Best-effort — a failure here just means the existing "stray"
+        // self-heal on the next manual sync is still the fallback.
+        try {
+          await supabase
+            .from("tiktok_advertisers")
+            .update({ tracked: true })
+            .eq("connection_id", connectionId)
+            .eq("advertiser_id", advId);
+        } catch (err) {
+          console.error(`[campaign-creator-run] tracked=true failed for ${advId}: ${err.message}`);
+        }
+
         // Enroll into the existing duplication + auto-appeal lifecycle.
         const reg = await registerForDuplication(supabase, {
           campaign_id: created.campaign_id,
