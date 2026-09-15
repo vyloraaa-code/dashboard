@@ -1,0 +1,20 @@
+-- Run this once in the Supabase SQL editor. Idempotent — safe to re-run.
+--
+-- Fixes a race between manual_dupe's own immediate duplication pass and the
+-- ~60s process_duplication tick (js/app.js runCampaignCreatorDuplication):
+-- both can pick up the SAME DUPLICATING row concurrently — manual_dupe's
+-- request can still be running its own pass when the next poll fires
+-- process_duplication, which also processes DUPLICATING rows (see the
+-- doc comment at the top of campaign-creator.js). With no mutual exclusion,
+-- both invocations read the same starting dupe_created, create their own
+-- overlapping batch of ad groups (colliding names like two different
+-- "adg4"s, both real on TikTok), and the row ends up over dupe_target —
+-- exactly the "asked for 10, got 14-15 with doubled names" bug.
+--
+-- dupe_claimed_at: set (to now()) by whichever invocation successfully claims
+-- a DUPLICATING row via a conditional UPDATE before calling duplicateForRow,
+-- cleared back to null once that invocation's pass finishes. A claim older
+-- than the staleness window used in code (see campaign-creator.js) is treated
+-- as abandoned (a crashed invocation) and can be reclaimed — never a
+-- permanent stuck lock.
+alter table campaign_creator_campaigns add column if not exists dupe_claimed_at timestamptz;

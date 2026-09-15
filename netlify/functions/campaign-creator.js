@@ -78,6 +78,36 @@ async function withClient(supabase, connection, fn) {
   }
 }
 
+// manual_dupe's own immediate pass and the ~60s process_duplication tick
+// (js/app.js runCampaignCreatorDuplication) can both fire for the same
+// DUPLICATING row — manual_dupe's request can still be running when the next
+// poll starts process_duplication, which also processes DUPLICATING rows.
+// With no mutual exclusion both invocations create their own overlapping
+// batch of ad groups off the same stale dupe_created, colliding names (two
+// real "adg4"s) and blowing past dupe_target. Claim the row atomically before
+// letting duplicateForRow create anything; a claim older than the staleness
+// window is treated as an abandoned/crashed invocation and can be reclaimed.
+// See supabase/campaign_creator_dupe_lock.sql.
+const DUPE_CLAIM_STALE_MS = 90 * 1000; // comfortably longer than either caller's own 45s deadline
+async function claimDuplicationRow(supabase, campaignId) {
+  const nowIso = new Date().toISOString();
+  const staleBefore = new Date(Date.now() - DUPE_CLAIM_STALE_MS).toISOString();
+  const claim = await supabase
+    .from("campaign_creator_campaigns")
+    .update({ dupe_claimed_at: nowIso })
+    .eq("campaign_id", campaignId)
+    .eq("dupe_status", "DUPLICATING")
+    .or(`dupe_claimed_at.is.null,dupe_claimed_at.lt.${staleBefore}`)
+    .select("campaign_id");
+  if (claim.error) {
+    // Migration not run yet (supabase/campaign_creator_dupe_lock.sql) —
+    // degrade to no locking rather than block duplication entirely.
+    if (/dupe_claimed_at/.test(claim.error.message || "")) return true;
+    return false;
+  }
+  return !!(claim.data && claim.data.length);
+}
+
 exports.handler = async function (event) {
   try {
     const supabase = getSupabase();
@@ -188,15 +218,29 @@ async function manualDupe(supabase, body) {
             results.push({ campaign_id: r.campaign_id, ok: true, dupe_status: "DUPLICATING", note: "queued for the next automatic cycle" });
             continue;
           }
+          const claimed = await claimDuplicationRow(supabase, r.campaign_id);
+          if (!claimed) {
+            // process_duplication's ~60s tick already owns this row right now.
+            results.push({
+              campaign_id: r.campaign_id,
+              ok: true,
+              dupe_status: "DUPLICATING",
+              dupe_created: r.dupe_created,
+              dupe_target: count,
+              note: "Already being processed — progress continues on its own.",
+            });
+            continue;
+          }
           r.__persist = (patch) => patchRow(supabase, r.campaign_id, patch);
           let out;
           try {
             out = await duplicateForRow({ client, row: r, advertiserStatus: advStatus.get(String(r.advertiser_id)), deadlineMs });
           } catch (err) {
+            await patchRow(supabase, r.campaign_id, { dupe_claimed_at: null });
             results.push({ campaign_id: r.campaign_id, ok: false, error: err.message });
             continue;
           }
-          await patchRow(supabase, r.campaign_id, out.patch);
+          await patchRow(supabase, r.campaign_id, { ...out.patch, dupe_claimed_at: null });
           console.log(`[campaign-creator] ${r.campaign_id} — manual_dupe -> ${out.patch.dupe_status || out.status} (${out.patch.dupe_created ?? r.dupe_created}/${count})`);
           results.push({
             campaign_id: r.campaign_id,
@@ -374,6 +418,17 @@ async function processDuplication(supabase) {
           }
 
           const beforeStatus = r.dupe_status;
+          // Only DUPLICATING actually creates ad groups (WAITING_FOR_ACTIVE
+          // here is just the Active-ness check above) — that's the only case
+          // that can collide with a concurrent manual_dupe pass on this row.
+          let claimed = true;
+          if (beforeStatus === "DUPLICATING") {
+            claimed = await claimDuplicationRow(supabase, r.campaign_id);
+          }
+          if (!claimed) {
+            tally.pending += 1;
+            continue; // a manual_dupe request already owns this row right now
+          }
           let out;
           try {
             out = await duplicateForRow({
@@ -385,9 +440,10 @@ async function processDuplication(supabase) {
             });
           } catch (err) {
             console.error(`[campaign-creator] ${r.campaign_id} failed: ${err.message}`);
+            if (beforeStatus === "DUPLICATING") await patchRow(supabase, r.campaign_id, { dupe_claimed_at: null });
             continue;
           }
-          await patchRow(supabase, r.campaign_id, out.patch);
+          await patchRow(supabase, r.campaign_id, beforeStatus === "DUPLICATING" ? { ...out.patch, dupe_claimed_at: null } : out.patch);
           const createdNow = Math.max(0, (Number(out.patch.dupe_created) || before) - before);
           tally.created += createdNow;
           const afterStatus = out.patch.dupe_status || out.status;
