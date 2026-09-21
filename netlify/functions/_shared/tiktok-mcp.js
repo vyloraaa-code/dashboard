@@ -2,7 +2,7 @@
 //
 // This module is the "MCP client" tier of the intended architecture:
 //
-//   Chigla Ads frontend
+//   Kryzxr Ads frontend
 //     -> our Netlify function
 //       -> this module (@modelcontextprotocol/sdk client + OAuth)
 //         -> official TikTok Ads MCP (https://business-api.tiktok.com/open_mcp/tt-ads-mcp-flat)
@@ -198,7 +198,7 @@ class SupabaseOAuthProvider {
 
   get clientMetadata() {
     return {
-      client_name: "Chigla Ads Dashboard",
+      client_name: "Kryzxr Ads Dashboard",
       redirect_uris: [this._redirectUrl],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
@@ -310,7 +310,7 @@ async function connectMcp({ provider, serverUrl }) {
     authProvider: provider,
   });
   const client = new Client(
-    { name: "chigla-ads-dashboard", version: "1.0.0" },
+    { name: "kryzxr-ads-dashboard", version: "1.0.0" },
     { capabilities: {} }
   );
   await client.connect(transport);

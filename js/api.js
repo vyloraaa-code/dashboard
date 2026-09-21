@@ -2,10 +2,10 @@
 // caches the last successful Glitchy result in localStorage so the dashboard
 // never has to render an empty state — even on a fresh browser with no network.
 
-const CACHE_KEY = "chigla_glitchy_cache_v1";
-const DAILY_CACHE_KEY = "chigla_daily_totals_cache_v1";
-const MABAC_CACHE_KEY = "chigla_mabac_cache_v1";
-const THEME_KEY = "chigla_theme_v1";
+const CACHE_KEY = "kryzxr_glitchy_cache_v1";
+const DAILY_CACHE_KEY = "kryzxr_daily_totals_cache_v1";
+const MABAC_CACHE_KEY = "kryzxr_mabac_cache_v1";
+const THEME_KEY = "kryzxr_theme_v1";
 
 export async function fetchGlitchyStats(startDate, endDate) {
   const res = await fetch(`/.netlify/functions/glitchy-stats?startDate=${startDate}&endDate=${endDate}`);
@@ -419,7 +419,7 @@ export async function validateCampaignForm(connectionId, advertiserIds, pageId) 
 }
 
 // Instant Form IDs the operator has used, remembered in this browser only.
-const CC_FORMS_KEY = "chigla_cc_forms_v1";
+const CC_FORMS_KEY = "kryzxr_cc_forms_v1";
 export function loadRememberedForms() {
   try {
     const raw = localStorage.getItem(CC_FORMS_KEY);
@@ -633,4 +633,32 @@ export function saveTheme(theme) {
   try {
     localStorage.setItem(THEME_KEY, theme);
   } catch (_) {}
+}
+
+// ---------------- Dismissed ghost sources ----------------
+// A Detailed Metrics row with only affiliate-network clicks/earnings and no
+// matching TikTok campaign (e.g. deleted directly in TikTok Ads Manager) can
+// be dismissed for the rest of today — see supabase/dismissed_sources.sql.
+
+export async function loadDismissedSources() {
+  const res = await fetch("/.netlify/functions/dismissed-sources");
+  return readTiktokResponse(res, "Couldn't load dismissed sources"); // { date, dismissed: [...] }
+}
+
+export async function dismissSource(sourceName) {
+  const res = await fetch("/.netlify/functions/dismissed-sources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "dismiss", source_name: sourceName }),
+  });
+  return readTiktokResponse(res, "Couldn't dismiss this row");
+}
+
+export async function restoreSource(sourceName) {
+  const res = await fetch("/.netlify/functions/dismissed-sources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "restore", source_name: sourceName }),
+  });
+  return readTiktokResponse(res, "Couldn't restore this row");
 }

@@ -62,7 +62,7 @@ create table if not exists tiktok_connections (
 
 -- ---------------------------------------------------------------------------
 -- Advertiser (ad account) rows discovered under each connection. `tracked` is
--- the user's selection of which accounts Chigla Ads should follow. Discovery
+-- the user's selection of which accounts Kryzxr Ads should follow. Discovery
 -- upserts the descriptive columns only, so a re-scan never clobbers `tracked`.
 -- ---------------------------------------------------------------------------
 create table if not exists tiktok_advertisers (

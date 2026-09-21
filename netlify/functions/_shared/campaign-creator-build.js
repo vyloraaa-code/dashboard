@@ -265,7 +265,7 @@ function imageDimensions(buf) {
 async function fetchImage(url) {
   let res;
   try {
-    res = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 ChiglaAds" } });
+    res = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 KryzxrAds" } });
   } catch (err) {
     throw new Error(`could not download the image (${err.message})`);
   }

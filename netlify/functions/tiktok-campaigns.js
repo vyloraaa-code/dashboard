@@ -347,7 +347,7 @@ exports.handler = async function (event) {
       } catch (err) {
         // The delete write failed — but that can also mean the campaign is
         // ALREADY gone from TikTok (deleted directly in Ads Manager, outside
-        // Chigla Ads, so campaign_status_update has nothing left to act on).
+        // Kryzxr Ads, so campaign_status_update has nothing left to act on).
         // Never guess this from the error text — ask TikTok itself via
         // campaign_get, the same check used to confirm this live. If it
         // genuinely returns nothing, there's nothing left to protect: clean up
@@ -392,7 +392,7 @@ exports.handler = async function (event) {
             ok: true,
             campaign_id: campaignId,
             outcome: "already_gone",
-            message: `Campaign “${campaignName}” was already deleted directly on TikTok — removed it from Chigla Ads too.`,
+            message: `Campaign “${campaignName}” was already deleted directly on TikTok — removed it from Kryzxr Ads too.`,
           });
         }
 
@@ -425,7 +425,7 @@ exports.handler = async function (event) {
             ok: true,
             campaign_id: campaignId,
             outcome: "hidden",
-            message: `Campaign could not be deleted from TikTok because this advertiser account is suspended. It has been hidden from Chigla Ads instead.`,
+            message: `Campaign could not be deleted from TikTok because this advertiser account is suspended. It has been hidden from Kryzxr Ads instead.`,
           });
         }
         return json(502, {

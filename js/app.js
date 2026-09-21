@@ -162,7 +162,7 @@ let openRowMenuFor = null; // campaignId whose ⋮ menu is open, or null
 let rowMenuEl = null; // the floating menu element (appended to <body>)
 let deleteCampaignTargets = []; // source row(s) pending delete confirmation
 let engagementManualTargets = []; // source row(s) for the open Engagement modal — 1 = single-campaign UI, >1 = batch
-const ENGAGEMENT_SERVICE_ID_KEY = "chigla_engagement_service_id_v1";
+const ENGAGEMENT_SERVICE_ID_KEY = "kryzxr_engagement_service_id_v1";
 // Which engagement kinds to actually send when "Add" is clicked — all on by
 // default; the modal's per-kind toggle switches flip these.
 const engagementToggles = { likes: true, saves: true, comments: true };
@@ -533,7 +533,7 @@ function startTimers() {
   // after a while it can fire far less often than every 60s, so data looks
   // stale until the next tick finally lands. Force an immediate refresh the
   // moment the tab becomes visible again, so switching back always shows the
-  // freshest data Chigla Ads can get right then, instead of waiting on a
+  // freshest data Kryzxr Ads can get right then, instead of waiting on a
   // throttled timer to catch up. Guarded so a rapid re-focus (e.g. alt-tabbing
   // back and forth) can't fire back-to-back refreshes.
   document.addEventListener("visibilitychange", () => {
@@ -1071,7 +1071,7 @@ async function confirmDeleteCampaign() {
   setStatus(
     targets.length > 1
       ? `${targets.length} campaigns deleted.`
-      : lastRes?.message || (lastRes?.outcome === "hidden" ? "Campaign hidden from Chigla Ads." : "Campaign deleted from TikTok."),
+      : lastRes?.message || (lastRes?.outcome === "hidden" ? "Campaign hidden from Kryzxr Ads." : "Campaign deleted from TikTok."),
     false
   );
   loadTiktokCampaigns();
