@@ -66,24 +66,35 @@ const { submitEngagementOrder, parseComments, configFor } = require("./_shared/e
 const { groupReasonsByCategory } = require("./_shared/appeals.js");
 const { applyAutoBudgetBumps } = require("./_shared/auto-budget-bump");
 const { discoverStrayCampaigns } = require("./_shared/stray-campaigns");
+const {
+  fetchEarningsToday,
+  applyLifecycleDecisions,
+  foldStaleLifecycleAccumBeforeReset,
+} = require("./_shared/testing-scale-engine");
 
 const CAMPAIGN_COLUMNS_BASE =
   "campaign_id, connection_id, advertiser_id, advertiser_name, campaign_name, objective_type, budget, budget_mode, campaign_operation_status, campaign_secondary_status, effective_status, effective_tone, status_detail, ad_count, active_ad_count, create_time, updated_at";
 const CAMPAIGN_COLUMNS = `${CAMPAIGN_COLUMNS_BASE}, bc_id, bc_name, affiliate_network`;
+const CAMPAIGN_COLUMNS_WITH_LIFECYCLE = `${CAMPAIGN_COLUMNS}, lifecycle_state`;
 
 async function readCampaigns(supabase) {
   let res = await supabase
     .from("tiktok_campaigns")
-    .select(`${CAMPAIGN_COLUMNS}, hidden`)
+    .select(`${CAMPAIGN_COLUMNS_WITH_LIFECYCLE}, hidden`)
     .order("campaign_name", { ascending: true });
   if (res.error && /hidden/.test(res.error.message || "")) {
     // hidden column not migrated yet (supabase/tiktok_campaign_hidden.sql)
+    res = await supabase.from("tiktok_campaigns").select(CAMPAIGN_COLUMNS_WITH_LIFECYCLE).order("campaign_name", { ascending: true });
+  }
+  if (res.error && /lifecycle_state/.test(res.error.message || "")) {
+    // testing_scale_lifecycle.sql not migrated yet — degrade to "testing" default
     res = await supabase.from("tiktok_campaigns").select(CAMPAIGN_COLUMNS).order("campaign_name", { ascending: true });
+    if (!res.error) res.data = (res.data || []).map((c) => ({ ...c, lifecycle_state: "testing" }));
   }
   if (res.error && /bc_(id|name)|affiliate_network/.test(res.error.message || "")) {
     res = await supabase.from("tiktok_campaigns").select(CAMPAIGN_COLUMNS_BASE).order("campaign_name", { ascending: true });
     if (!res.error)
-      res.data = (res.data || []).map((c) => ({ ...c, bc_id: null, bc_name: null, affiliate_network: "GLITCHY" }));
+      res.data = (res.data || []).map((c) => ({ ...c, bc_id: null, bc_name: null, affiliate_network: "GLITCHY", lifecycle_state: "testing" }));
   }
   // Campaigns hidden locally (TikTok refused deletion — suspended account) never
   // reach the dashboard.
@@ -1211,6 +1222,18 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   // still running the next day starts that day's $10/$50 ladder over, on top
   // of whatever budget it already earned (never rolled back) — see
   // _shared/auto-budget-bump.js.
+  // Testing/Scale engine (shadow mode): fold each stale campaign's final
+  // pre-rollover spend/payout/conversions into its lifecycle accumulators
+  // BEFORE the reset below zeroes today_spend — otherwise a test that's
+  // still running when the day rolls over would silently lose that day's
+  // contribution to its cumulative verdict. Best-effort; no-ops if the
+  // testing_scale_lifecycle.sql migration hasn't run yet.
+  try {
+    await foldStaleLifecycleAccumBeforeReset(supabase, date);
+  } catch (_) {
+    /* best-effort */
+  }
+
   try {
     const { error: resetErr } = await supabase
       .from("tiktok_campaigns")
@@ -1249,25 +1272,22 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   // NULL columns when persisting, and (auto_budget_baseline/auto_budget_bumps)
   // as the running state for the auto budget-bump feature below.
   //
-  // IMPORTANT: this must never come back empty just because the optional
-  // auto_budget_bump.sql migration hasn't run — knownById gates EVERY row of
-  // the persist upsert below (`if (!k) continue`), so an empty map here means
-  // today_spend/today_clicks/... silently stop being written at all, with no
-  // error surfaced anywhere. Degrade the select instead of trusting it blind.
+  // IMPORTANT: this must never come back empty just because an optional
+  // migration (auto_budget_bump.sql, testing_scale_lifecycle.sql, ...) hasn't
+  // run — knownById gates EVERY row of the persist upsert below
+  // (`if (!k) continue`), so an empty map here means today_spend/today_clicks/
+  // ...  silently stop being written at all, with no error surfaced anywhere.
+  // select("*") instead of an explicit column list so a not-yet-migrated
+  // column (e.g. lifecycle_state) is just silently absent from each row
+  // rather than erroring the whole select — the testing-scale-engine and
+  // auto-budget-bump modules both already default missing fields inline
+  // (`|| "testing"`, `|| 0`, etc.), same as resolveTrackedCampaign() does
+  // elsewhere in this file.
   let known;
   {
-    const res = await supabase
-      .from("tiktok_campaigns")
-      .select("campaign_id, connection_id, advertiser_id, campaign_name, effective_status, auto_budget_baseline, auto_budget_bumps");
-    if (res.error && /auto_budget_(bumps|baseline)/.test(res.error.message || "")) {
-      const fallback = await supabase
-        .from("tiktok_campaigns")
-        .select("campaign_id, connection_id, advertiser_id, campaign_name, effective_status");
-      known = fallback.data;
-    } else {
-      if (res.error) console.error(`[tiktok-metrics] "known" campaigns read failed: ${res.error.message}`);
-      known = res.data;
-    }
+    const res = await supabase.from("tiktok_campaigns").select("*");
+    if (res.error) console.error(`[tiktok-metrics] "known" campaigns read failed: ${res.error.message}`);
+    known = res.data;
   }
   const knownById = new Map((known || []).map((c) => [String(c.campaign_id), c]));
   const knownByAdvertiser = {};
@@ -1286,6 +1306,30 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
     /* no WH table — nothing to exclude */
   }
 
+  // Stray campaigns (unflagged, unwatched — see stray-campaigns.js) are
+  // excluded from the testing/scale engine the same way they're already
+  // excluded from Detailed Metrics, engagement, and Add Comments — nobody is
+  // managing them, so grading them would just be noise.
+  let strayIds = new Set();
+  try {
+    const { data: stray } = await supabase.from("stray_campaigns").select("campaign_id");
+    strayIds = new Set((stray || []).map((r) => String(r.campaign_id)));
+  } catch (_) {
+    /* no stray table — nothing to exclude */
+  }
+
+  // Testing/Scale engine (shadow mode): one account-wide Glitchy/Mabac fetch
+  // for the whole cycle, reused for every advertiser below — never refetched
+  // per advertiser. Best-effort: a failure here just means no verdicts get
+  // computed this cycle, never blocks metrics/spend persistence.
+  const cycleNowIso = new Date().toISOString();
+  let earningsToday = { glitchyBySource: {}, mabacBySub1: {}, errors: {} };
+  try {
+    earningsToday = await fetchEarningsToday(date);
+  } catch (err) {
+    console.error(`[testing-scale] earnings fetch failed: ${err.message}`);
+  }
+
   // Engagement FOUNDATION: on this ~60s tick, flip any campaign currently stored
   // as "Active" that has a post URL to READY. Idempotent, no external calls.
   await markEngagementReadyIfActive(
@@ -1302,6 +1346,8 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   const okAdvertiserIds = [];
   const budgetBumps = {}; // campaign_id -> { budget, auto_budget_baseline, auto_budget_bumps }
   const trueSpendByHour = {}; // "<hour>" -> spend, summed across every advertiser this cycle (Live Performance graph)
+  const lifecycleByCampaignId = {}; // campaign_id -> row of lifecycle_* fields to fold into the metrics upsert (testing-scale-engine, shadow mode)
+  const lifecycleEvents = []; // rows to insert into testing_scale_events — only campaigns whose lifecycle_state actually changed this cycle
 
   // Stay comfortably inside the function time limit even with many advertisers.
   // Netlify's synchronous functions cap out around 10s, but this same code also
@@ -1383,6 +1429,28 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
           } catch (err) {
             console.error(`[auto-budget] adv=${advId} failed: ${err.message}`);
           }
+
+          // Testing/Scale engine (shadow mode): reuses the SAME spendByCampaignId
+          // just built above — no extra TikTok call. Never calls
+          // setCampaignStatus/setAdgroupStatus/campaign_update — verdicts are
+          // logged only. Best-effort: a failure here never blocks metrics for
+          // the rest of this advertiser.
+          try {
+            const spendByCampaignId = {};
+            for (const [cid, m] of Object.entries(byId)) spendByCampaignId[cid] = m.spend;
+            const { rows: lcRows, events: lcEvents } = applyLifecycleDecisions({
+              spendByCampaignId,
+              knownById,
+              whIds,
+              strayIds,
+              earnings: earningsToday,
+              nowIso: cycleNowIso,
+            });
+            for (const r of lcRows) lifecycleByCampaignId[r.campaign_id] = r;
+            lifecycleEvents.push(...lcEvents);
+          } catch (err) {
+            console.error(`[testing-scale] adv=${advId} failed: ${err.message}`);
+          }
         } catch (err) {
           errors[`adv:${advId}`] = err.message;
           console.error(`[tiktok-metrics] report failed adv=${advId}: ${err.message}`);
@@ -1403,6 +1471,7 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
     const k = knownById.get(cid);
     if (!k) continue;
     const bump = budgetBumps[cid];
+    const lc = lifecycleByCampaignId[cid];
     rows.push({
       campaign_id: cid,
       connection_id: k.connection_id,
@@ -1413,6 +1482,18 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
       today_impressions: m.impressions,
       today_clicks: m.clicks,
       ...(bump ? { budget: bump.budget, auto_budget_baseline: bump.auto_budget_baseline, auto_budget_bumps: bump.auto_budget_bumps } : {}),
+      ...(lc
+        ? {
+            lifecycle_state: lc.lifecycle_state,
+            lifecycle_state_since: lc.lifecycle_state_since,
+            lifecycle_spend_accum: lc.lifecycle_spend_accum,
+            lifecycle_payout_accum: lc.lifecycle_payout_accum,
+            lifecycle_conversions_accum: lc.lifecycle_conversions_accum,
+            lifecycle_last_seen_today_spend: lc.lifecycle_last_seen_today_spend,
+            lifecycle_last_seen_today_payout: lc.lifecycle_last_seen_today_payout,
+            lifecycle_last_seen_today_conversions: lc.lifecycle_last_seen_today_conversions,
+          }
+        : {}),
       today_conversions: m.conversions,
       today_cpm: m.cpm,
       today_cpa: m.cpa,
@@ -1421,11 +1502,25 @@ async function campaignMetricsForScopedAdvertisers(supabase) {
   }
   if (rows.length) {
     const { error: upErr } = await supabase.from("tiktok_campaigns").upsert(rows, { onConflict: "campaign_id" });
-    if (upErr && !/today_(date|spend|impressions|clicks|conversions|cpm|cpa)|metrics_updated_at|auto_budget_(bumps|baseline)/.test(upErr.message || "")) {
+    if (upErr && !/today_(date|spend|impressions|clicks|conversions|cpm|cpa)|metrics_updated_at|auto_budget_(bumps|baseline)|lifecycle_/.test(upErr.message || "")) {
       // A real write error (not "column missing" — that just means the migration
       // hasn't been run yet, which only affects daily_totals, not the live table).
       errors.persist = upErr.message;
       console.error(`[tiktok-metrics] persist failed: ${upErr.message}`);
+    }
+  }
+
+  // Testing/Scale engine audit trail — only inserted for campaigns whose
+  // lifecycle_state actually changed this cycle. Best-effort: swallow
+  // "table doesn't exist yet" the same way missing columns are swallowed above.
+  if (lifecycleEvents.length) {
+    try {
+      const { error: evErr } = await supabase.from("testing_scale_events").insert(lifecycleEvents);
+      if (evErr && !/does not exist|schema cache|could not find/i.test(evErr.message || "")) {
+        console.error(`[testing-scale] events insert failed: ${evErr.message}`);
+      }
+    } catch (_) {
+      /* table not migrated yet */
     }
   }
 

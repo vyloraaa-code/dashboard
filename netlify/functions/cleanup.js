@@ -13,6 +13,7 @@
 //   Authorization: Bearer <CRON_SECRET>  on every call.
 
 const { supabaseClient, todayEst } = require("./_shared/glitchy-daily");
+const { foldStaleLifecycleAccumBeforeReset } = require("./_shared/testing-scale-engine");
 
 // Retention windows (single, simple rules).
 const WH_TERMINAL_DAYS = 7; // wh_warmup_campaigns rows in DELETED / FAILED
@@ -95,6 +96,18 @@ exports.handler = async function (event) {
   //    still running the next day starts that day's $10/$50 auto-budget ladder
   //    over, on top of whatever budget it already earned (never rolled back).
   //    See _shared/auto-budget-bump.js.
+  //
+  //    Testing/Scale engine (shadow mode): this cron is the only thing that
+  //    runs the day rollover when nobody has the dashboard open overnight, so
+  //    it needs the same fold-before-zero treatment as the inline reset in
+  //    tiktok-campaigns.js — otherwise a test still running overnight loses
+  //    that stretch of spend/payout from its cumulative verdict.
+  try {
+    await foldStaleLifecycleAccumBeforeReset(supabase, nyToday);
+  } catch (err) {
+    out.errors.lifecycle_accum_fold = err.message;
+  }
+
   await run(out, "stale_today_metrics", () =>
     supabase
       .from("tiktok_campaigns")

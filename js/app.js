@@ -719,6 +719,7 @@ function rebuildSources(opts = {}) {
       budget,
       tiktokPostUrl: tk ? tk.tiktok_post_url || null : null,
       engagementStatus: tk ? tk.engagement_status || "PENDING" : null,
+      lifecycleState: tk ? tk.lifecycle_state || "testing" : null,
     };
   });
 
@@ -828,6 +829,7 @@ function renderTable(newConversionSources) {
       <td class="select-cell">${selectCell(s)}</td>
       <td class="toggle-cell">${campaignToggle(s)}</td>
       <td>${statusBadge(s.status)}</td>
+      <td>${lifecycleBadge(s)}</td>
       <td class="source-name"><span class="expand-caret">▸</span>${crown}${escapeHtml(s.source)}</td>
       <td class="num">${money(s.spend)}</td>
       <td class="num">${money(s.cpm)}</td>
@@ -849,7 +851,7 @@ function renderTable(newConversionSources) {
       setTimeout(() => tr.classList.remove("new-conversion"), 2500);
     }
 
-    detailTr.innerHTML = `<td colspan="13"><div class="row-detail-inner"><div class="adgroups-panel" data-adgroups-for="${escapeHtml(s.campaignId || "")}"></div></div></td>`;
+    detailTr.innerHTML = `<td colspan="14"><div class="row-detail-inner"><div class="adgroups-panel" data-adgroups-for="${escapeHtml(s.campaignId || "")}"></div></div></td>`;
 
     if (state.expandedSources.has(s.source)) {
       tr.classList.add("expanded");
@@ -4132,6 +4134,19 @@ function statusBadge(status) {
   const tone = ["good", "warn", "bad", "neutral"].includes(status.tone) ? status.tone : "neutral";
   const tip = status.detail ? `${status.label} — ${status.detail}` : status.label;
   return `<span class="status-badge ${tone}" title="${escapeHtml(tip)}">${escapeHtml(status.label)}</span>`;
+}
+
+// Testing/Scale engine (shadow mode) — informational only, no automatic
+// action is taken on any of these verdicts yet.
+const LIFECYCLE_BADGE = {
+  testing: ["neutral", "Testing"],
+  scaling: ["good", "Scaling"],
+  killed: ["bad", "Killed"],
+};
+function lifecycleBadge(s) {
+  if (!s.hasTiktok || !s.lifecycleState) return `<span class="status-badge none">—</span>`;
+  const [tone, label] = LIFECYCLE_BADGE[s.lifecycleState] || ["neutral", s.lifecycleState];
+  return `<span class="status-badge ${tone}" title="Shadow-mode verdict — informational only, no automatic action taken">${escapeHtml(label)}</span>`;
 }
 
 function escapeHtml(str) {
