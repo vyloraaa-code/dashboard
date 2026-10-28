@@ -1760,6 +1760,13 @@ function wireWhWarmupEvents() {
     if (e.target.checked) whRemainingAdvs().forEach((a) => whState.selected.add(String(a.advertiser_id)));
     renderWhAdvertisers();
   });
+  // Exactly the warmed-up accounts the selected geo still isn't unlocked on,
+  // so a second WH can be run on them (clears any other picks).
+  document.getElementById("whSelectNoGeo").addEventListener("change", (e) => {
+    whState.selected.clear();
+    if (e.target.checked) whRewarmAdvs().forEach((a) => whState.selected.add(String(a.advertiser_id)));
+    renderWhAdvertisers();
+  });
   document.getElementById("whSelectAll").addEventListener("change", (e) => {
     const approved = whAdvsForConnection().filter((a) => advIsApproved(a));
     if (e.target.checked) approved.forEach((a) => whState.selected.add(String(a.advertiser_id)));
@@ -2139,6 +2146,17 @@ function whRemainingAdvs() {
   });
 }
 
+// Approved accounts whose WH already reached Active, with none warming now,
+// where the selected geo is still NOT targetable — candidates for another WH.
+function whRewarmAdvs() {
+  const warming = whWarmingByAdv();
+  const warmed = whWarmedByAdv(whState.connectionId);
+  return whAdvsForConnection().filter((a) => {
+    const id = String(a.advertiser_id);
+    return advIsApproved(a) && !warming.has(id) && warmed.has(id) && geoAvailable(id) === false;
+  });
+}
+
 // Reopen: if the user minimized mid-flow, resume exactly where they were —
 // same logic as Campaign Creator (openCampaignCreatorModal).
 async function openWhWarmupModal() {
@@ -2335,6 +2353,15 @@ function syncWhSelectAll() {
     whState.selected.size === remaining.length &&
     remaining.every((a) => whState.selected.has(String(a.advertiser_id)));
   rem.disabled = remaining.length === 0;
+  const rewarm = whRewarmAdvs();
+  const noGeo = document.getElementById("whSelectNoGeo");
+  noGeo.checked =
+    rewarm.length > 0 &&
+    whState.selected.size === rewarm.length &&
+    rewarm.every((a) => whState.selected.has(String(a.advertiser_id)));
+  noGeo.disabled = rewarm.length === 0;
+  document.getElementById("whSelectNoGeoLabel").textContent =
+    `Select warmed up but No ${acctState.geo} (re-run) · ${rewarm.length}`;
 }
 
 function updateWhNextButton() {
